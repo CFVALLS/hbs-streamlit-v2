@@ -63,7 +63,21 @@ from db.operaciones_db import (
 )
 
 from db.connection_db import establecer_engine, establecer_session, session_scope
-from utils.helpers import *
+from utils.helpers import (
+    tooltip,
+    add_notification,
+    show_notifications,
+    auto_refresh,
+    is_mobile,
+    get_json_costo_marginal_online,
+    get_costo_marginal_online_hora,
+    get_central,
+    get_cmg_programados,
+    tooltip_explanations,
+    insert_central,
+    reformat_to_iso,
+    create_status_piechart  # Add this line
+)
 
 #############################################################
 ################### CONFIGURATION ###########################
@@ -242,6 +256,9 @@ st.markdown("""
         .section-title {
             font-size: 1.25rem;
         }
+    }
+    body {
+        font-family: 'Roboto', sans-serif;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -753,8 +770,7 @@ else:
 tab1, tab2, tab3 = st.tabs(["Monitoreo", "Atributos", "Descarga Archivos"])
 
 with tab1:
-    st.header("Monitoreo")
-    
+    # st.header("Monitoreo")
     # First thing, check connection and show appropriate notification
     if not CONN_STATUS:
         add_notification("No se pudo conectar a la base de datos. Usando datos de prueba.", type="warning", duration=10)
