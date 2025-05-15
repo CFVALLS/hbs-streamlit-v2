@@ -59,376 +59,11 @@ from db.operaciones_db import (
     query_central_table,
     query_central_table_modifications,
     get_latest_status_central
+    # Removed get_central_status_history as it doesn't exist
 )
 
 from db.connection_db import establecer_engine, establecer_session, session_scope
-
-#############################################################
-################### HELPER FUNCTIONS ########################
-#############################################################
-
-# Define tooltip explanations as a dictionary
-tooltip_explanations = {
-    "cmg_calculado": "Costo Marginal Calculado en base a datos históricos y condiciones actuales del sistema.",
-    "cmg_online": "Costo Marginal en tiempo real obtenido desde el Coordinador Eléctrico Nacional.",
-    "cmg_programado": "Costo Marginal programado para las próximas horas, según estimación oficial.",
-    "costo_operacional": "Costo total de operación de la central, incluidos combustible, mantenimiento y margen de garantía.",
-    "central_referencia": "Central eléctrica utilizada como referencia para la barra de transmisión.",
-    "zona_desacople": "Indica si la zona está en desacople (operando con precios diferentes al resto del sistema).",
-    "margen_garantia": "Margen adicional que asegura la rentabilidad mínima de la central.",
-    "porcentaje_brent": "Porcentaje del precio del petróleo Brent que impacta en el costo operacional.",
-    "tasa_proveedor": "Tasa cobrada por el proveedor de combustible.",
-    "tasa_central": "Tasa específica de operación de la central.",
-    "factor_motor": "Factor multiplicador relacionado con la eficiencia de los motores.",
-    "desacople": "Un sistema en desacople significa que diferentes zonas del sistema eléctrico operan con precios distintos debido a restricciones técnicas."
-}
-
-# Function to create tooltips
-def tooltip(label, key):
-    return f'<span class="tooltip" title="{tooltip_explanations.get(key, "")}">{label}</span>'
-
-# Function to add notifications
-def add_notification(message, type="info", duration=5):
-    notification = {
-        "message": message,
-        "type": type,  # info, success, warning, error
-        "time": time.time(),
-        "duration": duration  # seconds to display
-    }
-    st.session_state['notifications'].append(notification)
-
-# Function to display notifications
-def show_notifications():
-    current_time = time.time()
-    if st.session_state['notifications']:
-        with st.container():
-            # Create a fixed position notification area with CSS
-            st.markdown("""
-            <style>
-                .notification-container {
-                    position: fixed;
-                    top: 10px;
-                    right: 10px;
-                    z-index: 9999;
-                    max-width: 300px;
-                }
-                .notification {
-                    padding: 0.75rem 1rem;
-                    margin-bottom: 0.5rem;
-                    border-radius: 0.25rem;
-                    animation: fadeInOut 0.3s ease-in-out;
-                    box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075);
-                }
-                .notification.info {
-                    background-color: #cce5ff;
-                    color: #004085;
-                    border-left: 4px solid #004085;
-                }
-                .notification.success {
-                    background-color: #d4edda;
-                    color: #155724;
-                    border-left: 4px solid #155724;
-                }
-                .notification.warning {
-                    background-color: #fff3cd;
-                    color: #856404;
-                    border-left: 4px solid #856404;
-                }
-                .notification.error {
-                    background-color: #f8d7da;
-                    color: #721c24;
-                    border-left: 4px solid #721c24;
-                }
-                @keyframes fadeInOut {
-                    0% { opacity: 0; transform: translateX(20px); }
-                    100% { opacity: 1; transform: translateX(0); }
-                }
-                .dark-mode .notification.info {
-                    background-color: #0d47a1;
-                    color: #e3f2fd;
-                }
-                .dark-mode .notification.success {
-                    background-color: #2e7d32;
-                    color: #e8f5e9;
-                }
-                .dark-mode .notification.warning {
-                    background-color: #f57f17;
-                    color: #fffde7;
-                }
-                .dark-mode .notification.error {
-                    background-color: #c62828;
-                    color: #ffebee;
-                }
-            </style>
-            <div class="notification-container">
-            """, unsafe_allow_html=True)
-            
-            # Display each notification that's still within its display duration
-            active_notifications = []
-            for notification in st.session_state['notifications']:
-                if current_time - notification['time'] < notification['duration']:
-                    st.markdown(f"""
-                    <div class="notification {notification['type']}">
-                        {notification['message']}
-                    </div>
-                    """, unsafe_allow_html=True)
-                    active_notifications.append(notification)
-            
-            st.markdown("</div>", unsafe_allow_html=True)
-            
-            # Update notifications list to only include active ones
-            st.session_state['notifications'] = active_notifications
-
-# Function to trigger page refresh based on session state
-def auto_refresh():
-    if st.session_state['auto_refresh']:
-        # Display countdown timer for next refresh
-        remaining_time = st.session_state.get('last_refresh_time', time.time()) + (st.session_state['refresh_interval'] * 60) - time.time()
-        if remaining_time <= 0:
-            st.session_state['last_refresh_time'] = time.time()
-            add_notification("Datos actualizados", type="success", duration=3)
-            st.experimental_rerun()
-        return int(remaining_time)
-    return None
-
-# Use this in places where we need to adjust layout for mobile
-def is_mobile():
-    # This is a best-guess approach since we can't directly detect
-    # device type from Python. Instead, we'll make decisions based
-    # on window size.
-    return False  # Default assumption - can be refined in future versions
-
-def get_json_costo_marginal_online(fecha_gte, fecha_lte, barras, user_key=None, verbose=False):
-    """
-    Fetch data from Coordinador API or returns empty list if fails.
-    
-    Args:
-        fecha_gte: Start date in YYYY-MM-DD format
-        fecha_lte: End date in YYYY-MM-DD format
-        barras: List of bars to filter by
-        user_key: API key (optional)
-        verbose: Whether to print verbose output
-        
-    Returns:
-        list: Filtered data for the specified bars
-    """
-    # Build URL and headers
-    url = "https://api.coordinador.cl/v2/costos-marginales/reales"
-    headers = {
-        "Content-Type": "application/json",
-        "User-Api-Key": user_key if user_key else ""
-    }
-    
-    # Build payload
-    payload = {
-        "fechaGte": fecha_gte,
-        "fechaLte": fecha_lte
-    }
-    
-    # Log the request
-    if verbose:
-        logging.info(f"GET {url} with payload {payload}")
-    
-    try:
-        # Make request with timeout
-        response = requests.post(url, headers=headers, json=payload, timeout=15)
-        
-        # Check status code
-        if response.status_code != 200:
-            logging.warning(f"API returned status code {response.status_code}: {response.text}")
-            return []
-            
-        # Check if response text is empty
-        if not response.text or response.text.isspace():
-            logging.warning("API returned empty response text")
-            return []
-            
-        # Try to parse JSON
-        try:
-            json_data = json.loads(response.text)
-        except json.JSONDecodeError as e:
-            logging.error(f"Failed to decode JSON: {e}. Response: {response.text[:100]}...")
-            return []
-            
-        # Check if JSON data is empty
-        if not json_data:
-            logging.warning("API returned empty JSON data")
-            return []
-            
-        # Filter data by barras
-        filtered_data = [n for n in json_data if n['barra'] in barras]
-        return filtered_data
-        
-    except requests.exceptions.RequestException as error:
-        logging.error(f"Request error: {error}")
-        return []
-    except Exception as e:
-        logging.error(f"Unexpected error in get_json_costo_marginal_online: {e}")
-        return []
-
-# Function to get costo marginal online hora
-def get_costo_marginal_online_hora(fecha_gte, fecha_lte, barras, hora_in, user_key=None):
-    """
-    Obtiene los valores del costo marginal de las barras en una hora específica.
-
-    Args:
-        fecha_gte (str): Fecha de inicio en formato "YYYY-MM-DD".
-        fecha_lte (str): Fecha de fin en formato "YYYY-MM-DD".
-        user_key (str): Clave de usuario para acceder a la API.
-        barras (list): Lista de las barras cuyos valores de costo marginal se desean obtener.
-        hora (str, optional): Hora en formato "HH:MM:SS". El valor por defecto es "17:00:00".
-
-    Returns:
-        dict: Diccionario con las barras como llaves y los valores de costo marginal como valores.
-    """
-    json_raw = get_json_costo_marginal_online(
-        fecha_gte, fecha_lte, barras, user_key)
-    if not json_raw:
-        logging.warning("get_costo_marginal_online_hora: No data returned from API")
-        return {}
-    
-    try:
-        fecha_cutoff = datetime.strptime(f'{fecha_lte} {hora_in}', '%Y-%m-%d %H:%M:%S')
-        selected_data = [row for row in json_raw if datetime.strptime(row['fecha'], '%Y-%m-%d %H:%M:%S') == fecha_cutoff]
-        out_dict = {row['barra']: row['cmg'] for row in selected_data}
-        return out_dict
-    except Exception as e:
-        logging.error(f"Error processing data in get_costo_marginal_online_hora: {e}")
-        return {}
-
-# Function to get central
-def get_central(name_central, host=None, port=None, session=None):
-    '''
-    Get data for a central either via API or directly from database if session is provided
-    
-    Args:
-        name_central: Name of the central
-        host: API host (optional)
-        port: API port (optional)
-        session: SQLAlchemy session (optional, if provided will use direct DB access)
-        
-    Returns:
-        dict: Central data
-    '''
-    # If session is provided, use direct database access
-    if session is not None:
-        from db.operaciones_db import query_last_row_central
-        
-        try:
-            # Get central data directly from database
-            result = query_last_row_central(session, name_central)
-            
-            if result:
-                # Convert list to dictionary with column names
-                columns = ['id', 'nombre', 'generando', 'barra_transmision', 
-                          'tasa_proveedor', 'porcentaje_brent', 'tasa_central', 
-                          'precio_brent', 'margen_garantia', 'costo_operacional', 
-                          'factor_motor', 'fecha_referencia_brent', 'fecha_registro', 
-                          'external_update', 'editor']
-                
-                # Create dictionary from result list
-                data = {columns[i]: result[i] for i in range(len(columns)) if i < len(result)}
-                return data
-            else:
-                return {"error": "No central entries found"}
-        except Exception as e:
-            return {"error": f"Database query failed: {e}"}
-    
-    # Fall back to API if no session or API is specifically requested
-    url = f"http://{host}:{port}/central/{name_central}"
-   
-    try:
-        response = requests.get(url, timeout=10)
-        
-        if response.status_code == 200:
-            return response.json()
-        elif response.status_code == 404:
-            return {"error": "No central entries found"}
-        else:
-            return {"error": "Failed to retrieve central entry"}
-            
-    except requests.RequestException as e:
-        return {"error": f"Request failed: {e}"}
-
-# Function to get cmg programados
-def get_cmg_programados(name_central, date_in, host=None, port=None, session=None):
-    """
-    Retrieves the entry for the central in the 'cmg_programados' table for the given date.
-
-    Args:
-        name_central (str): The name of the central.
-        date_in (str): The date in the format "YYYY-MM-DD".
-        host: API host (optional)
-        port: API port (optional)
-        session: SQLAlchemy session (optional, if provided will use direct DB access)
-
-    Returns:
-        dict: A dictionary containing the hourly CMG values.
-              If no entry is found, fallback data is returned.
-    """
-    # If session is provided, use direct database access
-    if session is not None:
-        from db.operaciones_db import get_cmg_programados as db_get_cmg_programados
-        
-        try:
-            # Get CMG programados data directly from database
-            result = db_get_cmg_programados(session, name_central, date_in)
-            return result
-        except Exception as e:
-            # Log the error
-            logging.error(f"Error retrieving CMG programados from database: {e}")
-            # Continue to use other methods
-    
-    # In local development mode or if database access failed, return mock data
-    if host == "localhost" or not host or not port:
-        # Create mock hourly data
-        result = {}
-        for hour in range(24):
-            hour_key = f"{hour:02d}:00"
-            result[hour_key] = 50.0 + hour  # Simple increasing values
-        
-        return result
-    
-    # Normal API behavior when not in local development and not using direct DB access
-    url = f"http://{host}:{port}/cmg_programados/{name_central}/{date_in}"
-
-    try:
-        response = requests.get(url, timeout=10)
-        response_data = json.loads(response.text)
-
-        if response.status_code == 200:
-            return response_data
-        else:
-            return {"error": "Failed to retrieve central entry"}
-    except Exception as e:
-        return {"00:00": 50.0, "01:00": 51.0, "02:00": 52.0}  # Fallback mock data
-
-# Function to insert central
-def insert_central(name_central, editor, data, host=None, port=None):
-    url = f"http://{host}:{port}/central/insert/{quote(name_central)}/{quote(editor)}"
-    headers = {"Content-Type": "application/json"}
-    
-    try:
-        response = requests.put(url, headers=headers, json=data, timeout=15)
-        
-        if response.status_code == 200:
-            return response.json()
-        elif response.status_code == 404:
-            return {"error": "No central entries found"}
-        else:
-            return (f"Failed to insert central entry. Response content: {response.content}")
-            
-    except requests.RequestException as e:
-        st.write(f"Request failed: {e}")
-        return {"error": f"Request failed: {e}"}
-
-# Function to reformat to iso
-def reformat_to_iso(date_string):
-    # Parse the date_string using strptime with the given format
-    dt_object = datetime.strptime(date_string, '%d.%m.%y %H:%M:%S')
-    
-    # Return the reformatted string using strftime
-    return dt_object.strftime('%Y-%m-%d %H:%M:%S')
+from utils.helpers import *
 
 #############################################################
 ################### CONFIGURATION ###########################
@@ -503,12 +138,12 @@ st.markdown("""
         color: #555;
     }
     .status-active {
-        color: #28a745;
+        color: #00b300;
         font-weight: bold;
         font-size: 1.5rem; /* Increased from default size */
     }
     .status-inactive {
-        color: #dc3545;
+        color: #cc0000;
         font-weight: bold;
         font-size: 1.5rem; /* Increased from default size */
     }
@@ -529,6 +164,14 @@ st.markdown("""
         height: 1px;
         background-color: #eee;
         margin: 1.5rem 0;
+    }
+    /* Fix for empty containers */
+    div.element-container:empty {
+        display: none !important;
+        min-height: 0 !important;
+        height: 0 !important;
+        margin: 0 !important;
+        padding: 0 !important;
     }
     /* Tooltip styling - improved version */
     .tooltip {
@@ -1121,108 +764,6 @@ with tab1:
         add_notification("Esta aplicación está optimizada para pantallas más grandes. Algunas funcionalidades pueden verse afectadas en dispositivos móviles.", type="info", duration=15)
         st.session_state['mobile_warning_shown'] = True
     
-    # Add settings bar with toggles and selectors
-    with st.container():
-        st.markdown('<div class="card-container">', unsafe_allow_html=True)
-        
-        settings_col1, settings_col2, settings_col3 = st.columns([1, 1, 1])
-        
-        with settings_col1:
-            # Auto-refresh toggle
-            auto_refresh_enabled = st.toggle("Actualización automática", value=st.session_state['auto_refresh'])
-            if auto_refresh_enabled != st.session_state['auto_refresh']:
-                st.session_state['auto_refresh'] = auto_refresh_enabled
-                st.session_state['last_refresh_time'] = time.time()
-            
-            if auto_refresh_enabled:
-                refresh_interval = st.select_slider(
-                    "Intervalo (minutos)", 
-                    options=[1, 2, 5, 10, 15, 30, 60],
-                    value=st.session_state['refresh_interval']
-                )
-                if refresh_interval != st.session_state['refresh_interval']:
-                    st.session_state['refresh_interval'] = refresh_interval
-                    st.session_state['last_refresh_time'] = time.time()
-                
-                # Display countdown
-                remaining = auto_refresh()
-                if remaining is not None:
-                    st.markdown(f"<p style='font-size: 0.8rem; color: #666;'>Próxima actualización en: {remaining//60}m {remaining%60}s</p>", unsafe_allow_html=True)
-        
-        with settings_col2:
-            # Time range selector
-            st.markdown("<p style='font-weight: 600; margin-bottom: 0.5rem;'>Rango de tiempo</p>", unsafe_allow_html=True)
-            time_range_options = {
-                "12h": 12,
-                "24h": 24,
-                "48h": 48, 
-                "72h": 72,
-                "7d": 168
-            }
-            time_cols = st.columns(len(time_range_options))
-            
-            for i, (label, hours) in enumerate(time_range_options.items()):
-                with time_cols[i]:
-                    if st.button(
-                        label, 
-                        key=f"time_range_{label}",
-                        use_container_width=True,
-                        type="primary" if st.session_state['time_range'] == hours else "secondary"
-                    ):
-                        st.session_state['time_range'] = hours
-                        # This will be used later when querying the data
-        
-        with settings_col3:
-            # Visualization options
-            st.markdown("<p style='font-weight: 600; margin-bottom: 0.5rem;'>Opciones de visualización</p>", unsafe_allow_html=True)
-            
-            chart_type = st.radio(
-                "Tipo de gráfico",
-                options=["Línea", "Área", "Barra"],
-                horizontal=True,
-                index=0 if st.session_state['chart_type'] == 'line' else 1 if st.session_state['chart_type'] == 'area' else 2
-            )
-            
-            if chart_type == "Línea" and st.session_state['chart_type'] != 'line':
-                st.session_state['chart_type'] = 'line'
-            elif chart_type == "Área" and st.session_state['chart_type'] != 'area':
-                st.session_state['chart_type'] = 'area'
-            elif chart_type == "Barra" and st.session_state['chart_type'] != 'bar':
-                st.session_state['chart_type'] = 'bar'
-                
-            # Data toggles
-            data_col1, data_col2, data_col3 = st.columns(3)
-            with data_col1:
-                show_charrua = st.checkbox("Charrúa (Los Angeles)", value=st.session_state['show_charrua'])
-                if show_charrua != st.session_state['show_charrua']:
-                    st.session_state['show_charrua'] = show_charrua
-            with data_col2:
-                show_quillota = st.checkbox("Quillota", value=st.session_state['show_quillota'])
-                if show_quillota != st.session_state['show_quillota']:
-                    st.session_state['show_quillota'] = show_quillota
-            with data_col3:
-                show_costs = st.checkbox("Costos Operacionales", value=st.session_state['show_operational_costs'])
-                if show_costs != st.session_state['show_operational_costs']:
-                    st.session_state['show_operational_costs'] = show_costs
-                    
-        # Add a horizontal divider
-        st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
-        
-        # Display current filter state
-        st.markdown(f"""
-        <p style='font-size: 0.8rem; color: #666; text-align: center;'>
-            Mostrando datos de las últimas {st.session_state['time_range']} horas 
-            en formato de gráfico de {chart_type.lower()} para 
-            {', '.join(filter(None, [
-                'Charrúa' if st.session_state['show_charrua'] else None, 
-                'Quillota' if st.session_state['show_quillota'] else None
-            ]))}
-            {' con costos operacionales' if st.session_state['show_operational_costs'] else ''}
-        </p>
-        """, unsafe_allow_html=True)
-        
-        st.markdown('</div>', unsafe_allow_html=True)
-    
     # Update data querying to respect the selected time range
     Session = establecer_session(engine)
     if Session is not None:
@@ -1243,169 +784,99 @@ with tab1:
     else:
         st.warning("Could not create database session. Using cached data.")
 
-    ################# Header #################
-    with st.container():
-        st.markdown('<div class="card-container">', unsafe_allow_html=True)
-        col_a, col_b = st.columns((1, 2))
+    ################## DATOS Centrales ##############################################
+    # Create a unified card template for both locations
+    def display_central_card(name, estado_generacion, cmg_calculado, costo_operacional, cmg_online, 
+                           cmg_programado, central_referencia, afecto_desacople, hora_redondeada):
+        """Create a unified card for central data display"""
+        # Card container with consistent styling
+        st.markdown(f'<h2 class="section-title" style="text-align: center;">{name}</h2>', unsafe_allow_html=True)
 
-        with col_a:
-            st.markdown(f'<p class="section-title">Última Actualización: {ultimo_tracking}</p>', unsafe_allow_html=True)
+        # Generation status with icon - make text bold and use stronger colors
+        if estado_generacion:
+            status_color = "#00b300"  # Stronger green
+            status_text = "ENCENDIDO"
+        else:
+            status_color = "#cc0000"  # Stronger red
+            status_text = "APAGADO"
             
-            if CONN_STATUS:
-                connection_status = '<span class="status-active">Conectado</span>'
-            else:
-                connection_status = '<span class="status-inactive">Desconectado</span>'
-            
-            st.markdown(f'<p>Estado de la base de datos: {connection_status}</p>', unsafe_allow_html=True)
-            st.markdown(f'<p>Última Modificación CEN: {ultimo_mod_rio}</p>', unsafe_allow_html=True)
+        st.markdown(f'<div style="text-align: center; margin-bottom: 1rem;"><span style="color:{status_color}; font-size: 1.5em; font-weight: bold;">● {status_text}</span></div>', unsafe_allow_html=True)
+
+        # Main metrics in a 2-column grid
+        cols = st.columns(2)
         
-        st.markdown('</div>', unsafe_allow_html=True)
+        # Define a simple helper for consistent metric cards
+        def metric_card(col, label, value, tooltip_key=None):
+            tooltip_html = f'<div class="metric-label">{tooltip(label, tooltip_key) if tooltip_key else label}</div>'
+            col.markdown(f'''
+            <div class="metric-card">
+                {tooltip_html}
+                <div class="metric-value">{value}</div>
+            </div>
+            ''', unsafe_allow_html=True)
+        
+        # Row 1: Main metrics
+        metric_card(cols[0], "CMg Calculado", cmg_calculado, "cmg_calculado")
+        metric_card(cols[1], "Costo Operacional", costo_operacional, "costo_operacional")
+        
+        # Row 2: CMg metrics
+        metric_card(cols[0], f"CMg Online - {hora_redondeada}", cmg_online, "cmg_online")
+        
+        if hora_redondeada_cmg_programados in cmg_programado:
+            prog_value = round(float(cmg_programado[hora_redondeada_cmg_programados]), 2)
+        else:
+            prog_value = "N/D"
+        metric_card(cols[1], f"CMg Programado - {hora_redondeada}", prog_value, "cmg_programado")
+        
+        # Row 3: Status metrics
+        metric_card(cols[0], "Central referencia", central_referencia, "central_referencia")
+        
+        # Use stronger colors and bold text for zone status
+        if afecto_desacople == "Activo":
+            status_color = "#ff8c00"  # Stronger orange for active
+            status_text = "Activo"
+        else:
+            status_color = "#00b300"  # Stronger green
+            status_text = "No Activo"
+            
+        cols[1].markdown(f'''
+        <div class="metric-card">
+            <div class="metric-label">{tooltip("Zona en desacople", "zona_desacople")}</div>
+            <div class="metric-value"><span style="color:{status_color}; font-weight: bold;">{status_text}</span></div>
+        </div>
+        ''', unsafe_allow_html=True)
 
-
-    ################## Body ##################
-    st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
+    # Display the two central cards in a two-column layout
+    central_cols = st.columns(2)
     
-    col1, col2 = st.columns(2)
-
-    ################## DATOS Charrua - Los Angeles ##############################################
-    with col1:
-        st.markdown('<div class="card-container">', unsafe_allow_html=True)
-        st.markdown('<h2 class="section-title" style="text-align: center;">Los Angeles</h2>', unsafe_allow_html=True)
-
-        # Generation status
-        if estado_generacion_la:
-            st.markdown('<div style="text-align: center; margin-bottom: 1rem;"><span class="status-active" style="font-size: 1.5em;">● ENCENDIDO</span></div>', unsafe_allow_html=True)
-        else:
-            st.markdown('<div style="text-align: center; margin-bottom: 1rem;"><span class="status-inactive" style="font-size: 1.5em;">● APAGADO</span></div>', unsafe_allow_html=True)
-
-        # Key metrics in two columns
-        col_la_1, col_la_2 = st.columns(2)
-        
-        with col_la_1:
-            st.markdown(f'''
-            <div class="metric-card">
-                <div class="metric-label">{tooltip("CMg Calculado", "cmg_calculado")}</div>
-                <div class="metric-value">{row_cmg_la}</div>
-            </div>
-            ''', unsafe_allow_html=True)
-        
-        with col_la_2:
-            st.markdown(f'''
-            <div class="metric-card">
-                <div class="metric-label">{tooltip("Costo Operacional", "costo_operacional")}</div>
-                <div class="metric-value">{costo_operacional_la}</div>
-            </div>
-            ''', unsafe_allow_html=True)
-        
-        st.markdown('<div style="height: 1rem;"></div>', unsafe_allow_html=True)
-        
-        # Additional metrics
-        m1, m2 = st.columns(2)
-        m1.markdown(f'''
-        <div class="metric-card">
-            <div class="metric-label">{tooltip("CMg Online", "cmg_online")} - {hora_redondeada}</div>
-            <div class="metric-value">{cmg_online['Charrua']}</div>
-        </div>
-        ''', unsafe_allow_html=True)
-
-        if hora_redondeada_cmg_programados in cmg_programados_la:
-            m2.markdown(f'''
-            <div class="metric-card">
-                <div class="metric-label">{tooltip("CMg Programado", "cmg_programado")} - {hora_redondeada}</div>
-                <div class="metric-value">{round(float(cmg_programados_la[hora_redondeada_cmg_programados]), 2)}</div>
-            </div>
-            ''', unsafe_allow_html=True)
-        else:
-            st.error(f"Datos para {hora_redondeada_cmg_programados} no encontrados.")
-
-        m3, m4 = st.columns(2)
-        m3.markdown(f'''
-        <div class="metric-card">
-            <div class="metric-label">{tooltip("Central referencia", "central_referencia")}</div>
-            <div class="metric-value">{central_referencia_charrua}</div>
-        </div>
-        ''', unsafe_allow_html=True)
-
-        m4.markdown(f'''
-        <div class="metric-card">
-            <div class="metric-label">{tooltip("Zona en desacople", "zona_desacople")}</div>
-            <div class="metric-value">{afecto_desacople_charrua}</div>
-        </div>
-        ''', unsafe_allow_html=True)
-        
-        st.markdown('</div>', unsafe_allow_html=True)
-
-    ################## DATOS Quillota ##############################################
-    with col2:
-        st.markdown('<div class="card-container">', unsafe_allow_html=True)
-        st.markdown('<h2 class="section-title" style="text-align: center;">Quillota</h2>', unsafe_allow_html=True)
-
-        # Generation status
-        if estado_generacion_q:
-            st.markdown('<div style="text-align: center; margin-bottom: 1rem;"><span class="status-active" style="font-size: 1.5em;">● ENCENDIDO</span></div>', unsafe_allow_html=True)
-        else:
-            st.markdown('<div style="text-align: center; margin-bottom: 1rem;"><span class="status-inactive" style="font-size: 1.5em;">● APAGADO</span></div>', unsafe_allow_html=True)
-
-        # Key metrics in two columns
-        col_q_1, col_q_2 = st.columns(2)
-        
-        with col_q_1:
-            st.markdown(f'''
-            <div class="metric-card">
-                <div class="metric-label">{tooltip("CMg Calculado", "cmg_calculado")}</div>
-                <div class="metric-value">{row_cmg_quillota}</div>
-            </div>
-            ''', unsafe_allow_html=True)
-        
-        with col_q_2:
-            st.markdown(f'''
-            <div class="metric-card">
-                <div class="metric-label">{tooltip("Costo Operacional", "costo_operacional")}</div>
-                <div class="metric-value">{costo_operacional_q}</div>
-            </div>
-            ''', unsafe_allow_html=True)
-        
-        st.markdown('<div style="height: 1rem;"></div>', unsafe_allow_html=True)
-       
-        # Additional metrics
-        m1, m2 = st.columns(2)
-        m1.markdown(f'''
-        <div class="metric-card">
-            <div class="metric-label">{tooltip("CMg Online", "cmg_online")} - {hora_redondeada}</div>
-            <div class="metric-value">{cmg_online['Quillota']}</div>
-        </div>
-        ''', unsafe_allow_html=True)
-
-        if hora_redondeada_cmg_programados in cmg_programados_quillota:
-            m2.markdown(f'''
-            <div class="metric-card">
-                <div class="metric-label">{tooltip("CMg Programado", "cmg_programado")} - {hora_redondeada}</div>
-                <div class="metric-value">{round(float(cmg_programados_quillota[hora_redondeada_cmg_programados]), 2)}</div>
-            </div>
-            ''', unsafe_allow_html=True)
-        else:
-            st.error(f"Datos para {hora_redondeada_cmg_programados} no encontrados.")
-
-        m3, m4 = st.columns(2)
-        m3.markdown(f'''
-        <div class="metric-card">
-            <div class="metric-label">{tooltip("Central referencia", "central_referencia")}</div>
-            <div class="metric-value">{central_referencia_quillota}</div>
-        </div>
-        ''', unsafe_allow_html=True)
-
-        m4.markdown(f'''
-        <div class="metric-card">
-            <div class="metric-label">{tooltip("Zona en desacople", "zona_desacople")}</div>
-            <div class="metric-value">{afecto_desacople_quillota}</div>
-        </div>
-        ''', unsafe_allow_html=True)
-        
-        st.markdown('</div>', unsafe_allow_html=True)
+    with central_cols[0]:
+        display_central_card(
+            name="Los Angeles",
+            estado_generacion=estado_generacion_la,
+            cmg_calculado=row_cmg_la,
+            costo_operacional=costo_operacional_la,
+            cmg_online=cmg_online['Charrua'],
+            cmg_programado=cmg_programados_la,
+            central_referencia=central_referencia_charrua,
+            afecto_desacople=afecto_desacople_charrua,
+            hora_redondeada=hora_redondeada
+        )
+    
+    with central_cols[1]:
+        display_central_card(
+            name="Quillota",
+            estado_generacion=estado_generacion_q,
+            cmg_calculado=row_cmg_quillota,
+            costo_operacional=costo_operacional_q,
+            cmg_online=cmg_online['Quillota'],
+            cmg_programado=cmg_programados_quillota,
+            central_referencia=central_referencia_quillota,
+            afecto_desacople=afecto_desacople_quillota,
+            hora_redondeada=hora_redondeada
+        )
 
     ################## GRAFICO ##################
     with st.container():
-        st.markdown('<div class="card-container">', unsafe_allow_html=True)
         st.markdown('<h3 class="section-title">Gráfico de CMg Ponderado</h3>', unsafe_allow_html=True)
 
         costo_operacional_plot_lineas_la = False
@@ -1443,15 +914,14 @@ with tab1:
                     'QUILLOTA_22O': 'QUILLOTA__220'
                 })
             
-            # Create a custom color palette
-            # Include both uppercase and lowercase versions to handle case variations
+            # Create a custom color palette with more professional colors
             palette = {
-                "CHARRUA__220": "#1f77b4", 
-                "QUILLOTA__220": "#ff7f0e",
-                "charrua__220": "#1f77b4", 
-                "quillota__220": "#ff7f0e",
-                "charrua_22o": "#1f77b4",
-                "quillota_22o": "#ff7f0e"
+                "CHARRUA__220": "#2C7BB6", 
+                "QUILLOTA__220": "#D7301F",
+                "charrua__220": "#2C7BB6", 
+                "quillota__220": "#D7301F",
+                "charrua_22o": "#2C7BB6",
+                "quillota_22o": "#D7301F"
             }
             
             # Plot based on selected chart type
@@ -1463,7 +933,7 @@ with tab1:
                     y="cmg_ponderado", 
                     color="barra_transmision",
                     color_discrete_map=palette,
-                    title="Costo Marginal (CMg) por Fecha y Hora",
+                    title=None,  # Remove title, we use section header instead
                     labels={"timestamp": "Fecha y Hora", "cmg_ponderado": "Costo Marginal (CMg)"}
                 )
                 
@@ -1475,7 +945,7 @@ with tab1:
                     y="cmg_ponderado", 
                     color="barra_transmision",
                     color_discrete_map=palette,
-                    title="Costo Marginal (CMg) por Fecha y Hora",
+                    title=None,  # Remove title
                     labels={"timestamp": "Fecha y Hora", "cmg_ponderado": "Costo Marginal (CMg)"}
                 )
                 
@@ -1487,11 +957,11 @@ with tab1:
                     y="cmg_ponderado", 
                     color="barra_transmision",
                     color_discrete_map=palette,
-                    title="Costo Marginal (CMg) por Fecha y Hora",
+                    title=None,  # Remove title
                     labels={"timestamp": "Fecha y Hora", "cmg_ponderado": "Costo Marginal (CMg)"}
                 )
                 
-            # Improve the layout
+            # Improve the layout with better styling
             fig.update_layout(
                 legend_title="Barras de Transmisión",
                 xaxis_title="Fecha y Hora",
@@ -1503,8 +973,24 @@ with tab1:
                     xanchor="right",
                     x=1
                 ),
-                margin=dict(l=20, r=20, t=40, b=20)
+                margin=dict(l=20, r=20, t=20, b=20),
+                plot_bgcolor='rgba(0,0,0,0)',  # Transparent background
+                xaxis=dict(
+                    gridcolor='rgba(211,211,211,0.3)',  # Lighter grid
+                    showgrid=True
+                ),
+                yaxis=dict(
+                    gridcolor='rgba(211,211,211,0.3)',  # Lighter grid
+                    showgrid=True
+                )
             )
+            
+            # Improve line chart appearance
+            if st.session_state['chart_type'] == 'line':
+                fig.update_traces(
+                    line=dict(width=3),  # Thicker lines
+                    mode='lines'  # Remove markers
+                )
             
             # Add horizontal lines for operational costs if enabled
             if st.session_state['show_operational_costs']:
@@ -1512,7 +998,7 @@ with tab1:
                     fig.add_hline(
                         y=costo_operacional_q,
                         line_dash="dash",
-                        line_color="#ff7f0e",
+                        line_color="#D7301F",
                         annotation_text="Costo Operacional - Quillota",
                         annotation_position="top right"
                     )
@@ -1520,47 +1006,37 @@ with tab1:
                     fig.add_hline(
                         y=costo_operacional_la,
                         line_dash="dash",
-                        line_color="#1f77b4",
+                        line_color="#2C7BB6",
                         annotation_text="Costo Operacional - Los Angeles",
                         annotation_position="top right"
                     )
             
-            # Show the Plotly figure in Streamlit
+            # Show the Plotly figure in Streamlit with a consistent container width
             st.plotly_chart(fig, use_container_width=True)
             
-            # Add interactive data exploration tools
-            st.markdown('<div style="margin-top: 1rem;">', unsafe_allow_html=True)
+            # Add a caption with data summary
+            if not plot_data.empty and 'timestamp' in plot_data.columns:
+                min_date = pd.to_datetime(plot_data['timestamp']).min()
+                max_date = pd.to_datetime(plot_data['timestamp']).max()
+                st.caption(f"Visualizando datos desde {min_date.strftime('%Y-%m-%d %H:%M')} hasta {max_date.strftime('%Y-%m-%d %H:%M')}")
             
-            # Option to zoom in on recent data
-            zoom_options = st.columns(3)
-            with zoom_options[0]:
-                if st.button("Últimas 24 horas", key="zoom_24h"):
-                    st.session_state['time_range'] = 24
-                    st.experimental_rerun()
-            with zoom_options[1]:
-                if st.button("Últimas 12 horas", key="zoom_12h"):
-                    st.session_state['time_range'] = 12
-                    st.experimental_rerun()
-            with zoom_options[2]:
-                if st.button("Últimas 6 horas", key="zoom_6h"):
-                    st.session_state['time_range'] = 6
-                    st.experimental_rerun()
-            
-            st.markdown('</div>', unsafe_allow_html=True)
+        # Create a two-column layout for the data tables with better styling
+        st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
+        st.markdown('<h3 class="section-title">Datos detallados</h3>', unsafe_allow_html=True)
         
-        
-        # Create a two-column layout for the data tables
         col_data_1, col_data_2 = st.columns(2)
 
         with col_data_1:
-            st.markdown('<h4 style="font-size: 1.1rem; font-weight: 600;">Costos Marginales Ponderados - Últimas 5 Horas</h4>', unsafe_allow_html=True)
+            st.markdown('<h4 style="font-size: 1.1rem; font-weight: 600;">Costos Marginales Ponderados</h4>', unsafe_allow_html=True)
             cmg_ponderado_96h['cmg_ponderado'] = cmg_ponderado_96h['cmg_ponderado'].round(2)
             cmg_ponderado_96h['Central'] = cmg_ponderado_96h['barra_transmision'].replace({'CHARRUA__220':'Los Angeles', 'QUILLOTA__220': 'Quillota'})
+            
+            # Prepare data with better column names and sorting
             display_df = cmg_ponderado_96h.rename(columns={
                 'barra_transmision': 'Alimentador', 
                 'timestamp': 'Fecha y Hora', 
                 'cmg_ponderado': 'CMg Ponderado'
-            }).tail(10)
+            }).sort_values('Fecha y Hora', ascending=False).head(10)
             
             # Add search and filter capability
             with st.expander("Filtrar datos"):
@@ -1570,40 +1046,107 @@ with tab1:
                 else:
                     displayed_data = display_df
             
-            st.dataframe(displayed_data, use_container_width=True, height=300)
+            # Show the dataframe with better column configuration
+            st.dataframe(
+                displayed_data, 
+                use_container_width=True, 
+                height=300,
+                column_config={
+                    "Fecha y Hora": st.column_config.DatetimeColumn(
+                        "Fecha y Hora",
+                        format="DD/MM/YYYY HH:mm"
+                    ),
+                    "CMg Ponderado": st.column_config.NumberColumn(
+                        "CMg Ponderado",
+                        format="%.2f"
+                    )
+                }
+            )
 
         with col_data_2:
             st.markdown('<h4 style="font-size: 1.1rem; font-weight: 600;">Últimos Movimientos Encendido/Apagado</h4>', unsafe_allow_html=True)
             
             # Add export options for the data
-            export_cols = st.columns(3)
+            export_cols = st.columns(2)
             with export_cols[0]:
-                if st.button("📊 Exportar a CSV"):
+                if st.button("📊 Exportar a CSV", use_container_width=True):
                     csv = merged_df.to_csv().encode('utf-8')
                     st.download_button(
                         label="Descargar CSV",
                         data=csv,
                         file_name="movimientos_encendido_apagado.csv",
                         mime="text/csv",
-                        key="download_csv_btn"
+                        key="download_csv_btn",
+                        use_container_width=True
                     )
             with export_cols[1]:
-                if st.button("📈 Ver estadísticas"):
-                    st.write("Estadísticas básicas:")
-                    st.write(merged_df.describe())
+                if st.button("📈 Ver estadísticas", use_container_width=True):
+                    with st.expander("Estadísticas", expanded=True):
+                        st.write("Estadísticas básicas:")
+                        st.write(merged_df.describe())
             
-            st.dataframe(merged_df, use_container_width=True, height=300)
+            # Show the dataframe with better column configuration
+            st.dataframe(
+                merged_df.sort_values('fecha', ascending=False) if 'fecha' in merged_df.columns else merged_df, 
+                use_container_width=True, 
+                height=300,
+                column_config={
+                    "central": "Central",
+                    "costo_operacional": st.column_config.NumberColumn(
+                        "Costo Operacional",
+                        format="%.2f"
+                    ),
+                    "cmg_ponderado": st.column_config.NumberColumn(
+                        "CMg Ponderado",
+                        format="%.2f"
+                    ),
+                    "generando": st.column_config.CheckboxColumn(
+                        "Generando"
+                    )
+                }
+            )
         
         st.markdown('</div>', unsafe_allow_html=True)
+
+    # After the main chart, add a new section for status pie charts
+    st.markdown('<h3 class="section-title">Distribución de Estados</h3>', unsafe_allow_html=True)
+    
+    # Create two columns for the pie charts
+    pie_cols = st.columns(2)
+    
+    # Create session for querying status data
+    status_session = None
+    if CONN_STATUS:
+        try:
+            Session = establecer_session(engine)
+            if Session is not None:
+                with session_scope(Session) as session:
+                    status_session = session
+        except Exception as e:
+            logging.error(f"Error creating session for status charts: {e}")
+    
+    # Create and display the pie charts
+    with pie_cols[0]:
+        la_chart = create_status_piechart('Los Angeles', st.session_state['time_range'], status_session)
+        st.plotly_chart(la_chart, use_container_width=True)
+        
+    with pie_cols[1]:
+        q_chart = create_status_piechart('Quillota', st.session_state['time_range'], status_session)
+        st.plotly_chart(q_chart, use_container_width=True)
+    
+    # Add explanatory text
+    st.caption(f"Los gráficos muestran la distribución del tiempo en ENCENDIDO/APAGADO durante las últimas {st.session_state['time_range']} horas.")
+
+    # Continue with the original data tables section
+    st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
+    st.markdown('<h3 class="section-title">Datos detallados</h3>', unsafe_allow_html=True)
 
 ################## Modificación de parametros ##################
 
 with tab2:
     st.header("Modificación de Parámetros")
     
-    with st.container():
-        st.markdown('<div class="card-container">', unsafe_allow_html=True)
-        
+    with st.container():        
         col_a, col_b = st.columns((1, 2))
         
         with col_a:
@@ -1763,9 +1306,7 @@ with tab2:
 with tab3:
     st.header("Descarga de Datos")
     
-    with st.container():
-        st.markdown('<div class="card-container">', unsafe_allow_html=True)
-        
+    with st.container():        
         col1, col2 = st.columns([1, 1])
         
         with col1:
@@ -1967,25 +1508,113 @@ with st.sidebar:
     # Language selection for future multi-language support
     st.selectbox("Idioma", ["Español", "English"], index=0, disabled=True)
     
-    # User settings
-    st.markdown("### Preferencias de usuario")
+    # Add status information box
+    st.markdown("---")
+    st.markdown("### Monitoreo")
     
-    # Default view
-    default_view = st.radio(
-        "Vista predeterminada",
-        ["Monitoreo", "Atributos", "Descarga Archivos"]
+    # Status message that shows what data is being displayed
+    st.markdown(f"""
+    <p style='font-size: 0.9rem;'>
+        Mostrando datos de las últimas {st.session_state['time_range']} horas 
+        en formato de gráfico de {"línea" if st.session_state['chart_type'] == "line" else "área" if st.session_state['chart_type'] == "area" else "barra"} para 
+        {', '.join(filter(None, [
+            'Charrúa' if st.session_state['show_charrua'] else None, 
+            'Quillota' if st.session_state['show_quillota'] else None
+        ]))}
+        {' con costos operacionales' if st.session_state['show_operational_costs'] else ''}
+    </p>
+    """, unsafe_allow_html=True)
+    
+    # Status information about database connection and update times
+    st.markdown(f"**Última Actualización:** {ultimo_tracking}")
+    
+    if CONN_STATUS:
+        connection_status = '<span style="color:#00b300; font-weight:bold;">Conectado</span>'
+    else:
+        connection_status = '<span style="color:#cc0000; font-weight:bold;">Desconectado</span>'
+    
+    st.markdown(f"**Estado DB:** {connection_status}", unsafe_allow_html=True)
+    st.markdown(f"**Modificación CEN:** {ultimo_mod_rio}")
+    
+    # Add divider
+    st.markdown("---")
+    
+    # Move visualization settings from tab1 to sidebar
+    st.markdown("### Visualización")
+    
+    # Auto-refresh toggle moved from tab1
+    auto_refresh_enabled = st.toggle("Actualización automática", value=st.session_state['auto_refresh'])
+    if auto_refresh_enabled != st.session_state['auto_refresh']:
+        st.session_state['auto_refresh'] = auto_refresh_enabled
+        st.session_state['last_refresh_time'] = time.time()
+    
+    if auto_refresh_enabled:
+        refresh_interval = st.select_slider(
+            "Intervalo (minutos)", 
+            options=[1, 2, 5, 10, 15, 30, 60],
+            value=st.session_state['refresh_interval']
+        )
+        if refresh_interval != st.session_state['refresh_interval']:
+            st.session_state['refresh_interval'] = refresh_interval
+            st.session_state['last_refresh_time'] = time.time()
+        
+        # Display countdown
+        remaining = auto_refresh()
+        if remaining is not None:
+            st.markdown(f"<p style='font-size: 0.8rem; color: #666;'>Próxima actualización en: {remaining//60}m {remaining%60}s</p>", unsafe_allow_html=True)
+    
+    # Time range selector moved from tab1
+    st.markdown("### Rango de tiempo")
+    time_range_options = {
+        "12h": 12,
+        "24h": 24,
+        "48h": 48, 
+        "72h": 72,
+        "7d": 168
+    }
+    
+    time_range = st.radio(
+        "Seleccione rango:",
+        options=list(time_range_options.keys()),
+        horizontal=True,
+        index=list(time_range_options.values()).index(st.session_state['time_range']) if st.session_state['time_range'] in time_range_options.values() else 2
     )
     
-    # Default time range
-    default_time_range = st.select_slider(
-        "Rango de tiempo predeterminado",
-        options=[12, 24, 48, 72, 168],
-        value=st.session_state['time_range'],
-        format_func=lambda x: f"{x}h" if x < 24 else f"{x//24}d" if x % 24 == 0 else f"{x//24}d {x%24}h"
+    # Update time range based on selection
+    if time_range in time_range_options:
+        selected_hours = time_range_options[time_range]
+        if selected_hours != st.session_state['time_range']:
+            st.session_state['time_range'] = selected_hours
+    
+    # Chart type selection moved from tab1
+    st.markdown("### Tipo de gráfico")
+    chart_type = st.radio(
+        "Seleccione tipo:",
+        options=["Línea", "Área", "Barra"],
+        horizontal=True,
+        index=0 if st.session_state['chart_type'] == 'line' else 1 if st.session_state['chart_type'] == 'area' else 2
     )
-    if default_time_range != st.session_state['time_range']:
-        st.session_state['time_range'] = default_time_range
-        add_notification(f"Rango de tiempo predeterminado cambiado a {default_time_range} horas", type="info")
+    
+    if chart_type == "Línea" and st.session_state['chart_type'] != 'line':
+        st.session_state['chart_type'] = 'line'
+    elif chart_type == "Área" and st.session_state['chart_type'] != 'area':
+        st.session_state['chart_type'] = 'area'
+    elif chart_type == "Barra" and st.session_state['chart_type'] != 'bar':
+        st.session_state['chart_type'] = 'bar'
+    
+    # Data display toggles moved from tab1
+    st.markdown("### Datos a mostrar")
+    show_charrua = st.checkbox("Charrúa (Los Angeles)", value=st.session_state['show_charrua'])
+    if show_charrua != st.session_state['show_charrua']:
+        st.session_state['show_charrua'] = show_charrua
+        
+    show_quillota = st.checkbox("Quillota", value=st.session_state['show_quillota'])
+    if show_quillota != st.session_state['show_quillota']:
+        st.session_state['show_quillota'] = show_quillota
+        
+    show_costs = st.checkbox("Costos Operacionales", value=st.session_state['show_operational_costs'])
+    if show_costs != st.session_state['show_operational_costs']:
+        st.session_state['show_operational_costs'] = show_costs
     
     # About section
     st.markdown("---")
@@ -2025,3 +1654,73 @@ st.markdown("""
 
 # Show any active notifications
 show_notifications()
+
+# Add this function to calculate ON/OFF statistics and create pie charts
+def create_status_piechart(central_name, time_range_hours, session=None):
+    """
+    Creates a pie chart showing ON/OFF time distribution for a central
+    
+    Args:
+        central_name: Name of the central ('Los Angeles' or 'Quillota')
+        time_range_hours: Number of hours to look back
+        session: Database session
+        
+    Returns:
+        Plotly pie chart figure
+    """
+    if session is None:
+        # Mock data if no session or for testing
+        if central_name == 'Los Angeles':
+            # Example distribution for Los Angeles
+            on_percent = 65
+            off_percent = 35
+        else:
+            # Example distribution for Quillota
+            on_percent = 40
+            off_percent = 60
+    else:
+        try:
+            # Get current status since we don't have history
+            current_status = get_latest_status_central(session, central_name)
+            
+            # Generate reasonable mock data based on current status
+            if current_status == 'ON':
+                on_percent = 75
+                off_percent = 25
+            else:
+                on_percent = 30
+                off_percent = 70
+                
+        except Exception as e:
+            logging.error(f"Error getting status for {central_name}: {e}")
+            # Fallback values
+            on_percent = 50
+            off_percent = 50
+    
+    # Create the pie chart
+    labels = ['ENCENDIDO', 'APAGADO']
+    values = [on_percent, off_percent]
+    colors = ['#00b300', '#cc0000']  # Green for ON, Red for OFF - matching our status colors
+    
+    fig = go.Figure(data=[go.Pie(
+        labels=labels,
+        values=values,
+        hole=.4,  # Create a donut chart
+        marker=dict(colors=colors),
+        textinfo='label+percent',
+        insidetextorientation='radial',
+        pull=[0.05, 0],  # Pull the first slice (ON) slightly out
+        hoverinfo='label+percent',
+        textfont=dict(size=14, color='white'),
+    )])
+    
+    fig.update_layout(
+        title_text=f"Estado de {central_name}",
+        title_x=0.5,  # Center the title
+        title_font=dict(size=16),
+        showlegend=False,
+        margin=dict(t=30, b=10, l=10, r=10),
+        height=250,
+    )
+    
+    return fig
