@@ -797,7 +797,7 @@ def get_status_central_history(session_in, limit=50, centrals=None):
 if __name__ == "__main__":
     # test connection and query manually in here
     try:
-        engine, metadata = establecer_engine(database='hbsv2', user='cfvallsj', password='Cristianlol720#', host='50.116.33.23', port='3306')
+        engine, metadata = establecer_engine(database='hbsv2', user='cfvallsj', password='', host='', port='3306')
         session = establecer_session(engine)
         
         if session is None:
