@@ -58,8 +58,8 @@ from db.operaciones_db import (
     query_values_last_desacople_bool,
     query_central_table,
     query_central_table_modifications,
-    get_latest_status_central
-    # Removed get_central_status_history as it doesn't exist
+    get_latest_status_central,
+    get_status_central_history
 )
 
 from db.connection_db import establecer_engine, establecer_session, session_scope
@@ -614,135 +614,41 @@ if engine is not None:
                 else:
                     row_cmg_la = 0.0
 
-                df_central_to_merge = df_central.copy()
-                # Check if df_central_to_merge is not empty and fecha_registro is available
-                if not df_central_to_merge.empty and 'fecha_registro' in df_central_to_merge.columns:
-                    # Ensure fecha_registro column is string type for string operations
-                    df_central_to_merge['fecha_registro'] = df_central_to_merge['fecha_registro'].astype(str)
-                    
-                    try:
-                        # First try: Check if values contain spaces to split
-                        valid_rows = df_central_to_merge['fecha_registro'].str.contains(' ', na=False)
-                        
-                        if valid_rows.any():
-                            # Before splitting, check if the format is correct (has date and time parts)
-                            # Create a simple regex check for common date-time patterns
-                            has_proper_format = df_central_to_merge.loc[valid_rows, 'fecha_registro'].str.match(
-                                r'(\d{1,4}[.-/]\d{1,2}[.-/]\d{1,4}|\d{1,4}[.-/]\d{1,2}[.-/]\d{2,4})\s+\d{1,2}:\d{1,2}(:\d{1,2})?'
-                            )
-                            
-                            if has_proper_format.any():
-                                # Process only rows with proper date-time format
-                                df_valid = df_central_to_merge[valid_rows & has_proper_format].copy()
-                                df_valid[['fecha', 'hora']] = df_valid['fecha_registro'].str.split(' ', expand=True)
-                                df_central_to_merge = df_valid
-                            else:
-                                # Spaces exist but not in expected date-time format
-                                st.warning("Fecha registro values contain spaces but not in expected date-time format.")
-                                raise ValueError("Invalid date-time format despite having spaces")
-                        else:
-                            # Second try: If no spaces, try to parse the entire string as a date
-                            try:
-                                # Create fecha with the full date and use default hour
-                                date_col = pd.to_datetime(df_central_to_merge['fecha_registro'], errors='coerce')
-                                # Check if conversion was successful before using .dt
-                                if pd.api.types.is_datetime64_any_dtype(date_col) and not date_col.isna().all():
-                                    df_central_to_merge['fecha'] = date_col.dt.strftime('%Y-%m-%d')
-                                    # Set default hour of 00:00:00
-                                    df_central_to_merge['hora'] = '00:00:00'
-                                    # Log this event once but don't show a warning to users every time
-                                    logger.debug("No date-time separators found. Using dates with default time 00:00:00.")
-                                else:
-                                    # Use current date as fallback
-                                    df_central_to_merge['fecha'] = chile_datetime.strftime('%Y-%m-%d')
-                                    df_central_to_merge['hora'] = '00:00:00'
-                                    logger.warning("Could not parse any dates from fecha_registro. Using current date.")
-                            except Exception as e:
-                                # Third try: If all else fails, use current date and time
-                                logging.warning(f"Error parsing dates: {e}. Using current date and time.")
-                                df_central_to_merge['fecha'] = chile_datetime.strftime('%Y-%m-%d')
-                                df_central_to_merge['hora'] = '00:00:00'
-                        
-                        # Process hora column to standard format if it exists
-                        if 'hora' in df_central_to_merge.columns:
-                            try:
-                                # First ensure hora is string type for consistent processing
-                                if not pd.api.types.is_string_dtype(df_central_to_merge['hora']):
-                                    df_central_to_merge['hora'] = df_central_to_merge['hora'].astype(str)
-                                
-                                # Now convert to datetime for .dt operations
-                                hora_dt = pd.to_datetime(df_central_to_merge['hora'], format='%H:%M:%S', errors='coerce')
-                                
-                                # Replace NaT values with default time
-                                hora_dt.loc[hora_dt.isna()] = pd.to_datetime('00:00:00', format='%H:%M:%S')
-                                
-                                # Check if conversion successful before using .dt
-                                if pd.api.types.is_datetime64_any_dtype(hora_dt):
-                                    # Apply floor to hour and convert to time
-                                    df_central_to_merge['hora'] = hora_dt.dt.floor('h').dt.time
-                                else:
-                                    # Fallback to string format if conversion failed
-                                    df_central_to_merge['hora'] = '00:00:00'
-                                    logging.warning("Could not convert hora to datetime. Using default time.")
-                            except Exception as e:
-                                logging.warning(f"Error processing hora column: {e}. Using default time.")
-                                df_central_to_merge['hora'] = '00:00:00'
-                    except Exception as e:
-                        st.warning(f"Error processing fecha_registro: {e}. Using default values.")
-                        # Set default values for fecha and hora columns
-                        df_central_to_merge['fecha'] = chile_datetime.strftime('%Y-%m-%d')
-                        df_central_to_merge['hora'] = chile_datetime.replace(hour=0, minute=0, second=0).time()
-                else:
-                    # Create empty DataFrame with required columns
-                    df_central_to_merge = pd.DataFrame(columns=['id', 'nombre', 'fecha_registro', 'fecha', 'hora'])
-
-                # Reformat the 'fecha' column in cmg_ponderado
+                # Get status history from StatusCentral table
+                # This will directly provide the data we need for the "Últimos Movimientos Encendido/Apagado" table
                 try:
-                    cmg_ponderado['fecha'] = pd.to_datetime(cmg_ponderado['fecha'], format='%Y-%m-%d')
-                except ValueError:
-                    # Try alternative format
-                    cmg_ponderado['fecha'] = pd.to_datetime(cmg_ponderado['fecha'], errors='coerce')
-
-                # Reformat the 'fecha' column in df_central_to_merge
-                try:
-                    df_central_to_merge['fecha'] = pd.to_datetime(df_central_to_merge['fecha'], format='%d.%m.%y')
-                except ValueError:
-                    # Try alternative format
-                    try:
-                        df_central_to_merge['fecha'] = pd.to_datetime(df_central_to_merge['fecha'], format='%Y-%m-%d')
-                    except ValueError:
-                        df_central_to_merge['fecha'] = pd.to_datetime(df_central_to_merge['fecha'], errors='coerce')
-
-                # Rename the 'nombre' column in df_central_to_merge to 'central'
-                df_central_to_merge.rename(columns={'nombre': 'central'}, inplace=True)
-
-                # Perform the merge on 'hora', 'fecha', and 'central' columns
-                cmg_ponderado['hora'] = cmg_ponderado['hora'].astype(str)
-                cmg_ponderado['fecha'] = cmg_ponderado['fecha'].astype(str)
-
-                df_central_to_merge['hora'] = df_central_to_merge['hora'].astype(str)
-                df_central_to_merge['fecha'] = df_central_to_merge['fecha'].astype(str)
-
-                merged_df = pd.merge(cmg_ponderado, df_central_to_merge, on=['hora', 'fecha', 'central'], how='inner')
+                    if session is not None:
+                        merged_df = get_status_central_history(
+                            session_in=session, 
+                            limit=50, 
+                            centrals=['Los Angeles', 'Quillota']
+                        )
+                    else:
+                        logging.error("Cannot get status history: session is None")
+                        merged_df = pd.DataFrame()
+                except Exception as e:
+                    logging.error(f"Error getting status history: {e}")
+                    merged_df = pd.DataFrame()
                 
-                # Only drop columns that exist in the merged dataframe
-                columns_to_drop = []
-                for col in ['timestamp', 'fecha_registro', 'external_update', 'editor', 'barra_transmision', 'id']:
-                    if col in merged_df.columns:
-                        columns_to_drop.append(col)
-                        
-                if columns_to_drop:
-                    merged_df.drop(columns_to_drop, axis=1, inplace=True)
-                    
-                # Select columns in the desired order, only if they exist
-                desired_columns = ['central', 'costo_operacional', 'generando', 'cmg_ponderado', 
-                                'fecha', 'hora', 'margen_garantia', 'factor_motor', 
-                                'tasa_proveedor', 'porcentaje_brent', 'tasa_central', 
-                                'precio_brent', 'fecha_referencia_brent']
-                
-                # Filter to only include columns that exist in the dataframe
-                available_columns = [col for col in desired_columns if col in merged_df.columns]
-                merged_df = merged_df[available_columns]
+                # If merged_df is empty (no status history yet), create a minimal DataFrame
+                if merged_df.empty:
+                    merged_df = pd.DataFrame({
+                        'central': ['Los Angeles', 'Quillota'],
+                        'timestamp': [chile_datetime.strftime('%Y-%m-%d %H:%M:%S')] * 2,
+                        'fecha': [chile_datetime.strftime('%Y-%m-%d')] * 2,
+                        'hora': [chile_datetime.strftime('%H:%M:%S')] * 2,
+                        'cmg_ponderado': [row_cmg_la, row_cmg_quillota],
+                        'costo_operacional': [costo_operacional_la, costo_operacional_q],
+                        'generando': [estado_generacion_la, estado_generacion_q],
+                        'status_operacional': [
+                            'ON' if estado_generacion_la else 'OFF',
+                            'ON' if estado_generacion_q else 'OFF'
+                        ]
+                    })
+
+                # Data for "Últimos Movimientos Encendido/Apagado" comes directly from StatusCentral table
+                # We've removed the unnecessary code that was overwriting this data with complex merging logic
+
         except Exception as e:
             st.error(f"Error accessing database: {str(e)}")
             # Log the error
@@ -1118,6 +1024,9 @@ with tab1:
                     ),
                     "generando": st.column_config.CheckboxColumn(
                         "Generando"
+                    ),
+                    "status_operacional": st.column_config.TextColumn(
+                        "Estado"
                     )
                 }
             )

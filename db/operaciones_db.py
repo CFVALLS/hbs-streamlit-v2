@@ -718,70 +718,165 @@ def get_latest_status_central(session_in, central_name):
         logger.error(f"Error fetching latest status for {central_name}: {e}")
         return None
 
-if __name__ == "__main__":
-    # tesxt connection and query manually in here
-    engine, metadata = establecer_engine(database= 'hbsv2', user= 'admin', password= 'Cristianlol720#', host= '10.0.0.139', port= '3306')
-    session = establecer_session(engine)
+def get_status_central_history(session_in, limit=50, centrals=None):
+    """
+    Retrieves the status history for centrals from the status_central table.
     
-    # Current timestamp for testing
-    current_time = int(datetime.now().timestamp())
-    yesterday = datetime.now() - timedelta(days=1)
-    yesterday_str = yesterday.strftime('%d.%m.%y')
-    today_str = datetime.now().strftime('%Y-%m-%d')
-    
-    print("\n===== Testing CMG Programados =====")
-    print(get_cmg_programados(session_in=session, name_central='Quillota', date_in=today_str))
-    
-    print("\n===== Testing CMG Ponderado =====")
-    print(query_cmg_ponderado_by_time(session_in=session, unixtime=current_time, delta_hours=24))
-    
-    print("\n===== Testing CMG Tiempo Real =====")
+    Args:
+        session_in (sqlalchemy.orm.session.Session): SQLAlchemy Session object.
+        limit (int): Maximum number of records to retrieve.
+        centrals (list): Optional list of central names to filter by.
+        
+    Returns:
+        DataFrame: DataFrame with status history or empty DataFrame if error.
+    """
     try:
-        print(get_cmg_tiempo_real(session_in=session, unix_time_in=current_time - 3600))
-    except TypeError:
-        # Handling the case where the function doesn't accept delta_hours
-        print(get_cmg_tiempo_real(session_in=session, unix_time_in=current_time - 3600))
-    
-    print("\n===== Testing Costo Marginal TCO =====")
-    print("Bloque A:", retrieve_costo_marginal_tco(bloque='A', central='QUINTERO-2_GN_A', session_in=session, date_in=yesterday_str))
-    print("Bloque B:", retrieve_costo_marginal_tco(bloque='B', central='QUINTERO-2_GN_A', session_in=session, date_in=yesterday_str))
-    print("Bloque C:", retrieve_costo_marginal_tco(bloque='C', central='QUINTERO-2_GN_A', session_in=session, date_in=yesterday_str))
-    
-    print("\n===== Testing Factor Penalización =====")
-    print("QUILLOTA_22O:", retrieve_valor_factor_penalizacion(session_in=session, barra_in='QUILLOTA_22O'))
-    print("CHARRUA_22O:", retrieve_valor_factor_penalizacion(session_in=session, barra_in='CHARRUA_22O'))
-    
-    print("\n===== Testing Rio Raw Data =====")
-    print(retrieve_last_entry_from_rio_raw_data(session=session))
-    
-    print("\n===== Testing Tracking Coordinador =====")
-    print(retrieve_tracking_coordinador(session=session))
-    
-    print("\n===== Testing Central Queries =====")
-    print("Last Row for Quillota:", query_last_row_central(session_in=session, name_central='Quillota'))
-    
-    print("\n===== Testing Central Table =====")
-    central_df = query_central_table(session_in=session, num_entries=3)
-    print(f"Retrieved {len(central_df)} centrals")
-    if not central_df.empty:
-        print(central_df[['id', 'nombre', 'barra_transmision']].head())
-    
-    print("\n===== Testing Modified Centrals =====")
-    mod_central_df = query_central_table_modifications(session_in=session, num_entries=3)
-    print(f"Retrieved {len(mod_central_df)} modified centrals")
-    if not mod_central_df.empty:
-        print(mod_central_df[['id', 'nombre', 'external_update']].head())
-    
-    print("\n===== Testing Desacople Status =====")
-    print("QUILLOTA__220:", retrieve_status_desacople(session=session, barra_transmision_in='QUILLOTA__220'))
-    print("CHARRUA__220:", retrieve_status_desacople(session=session, barra_transmision_in='CHARRUA__220'))
-    
-    print("\n===== Testing Last Desacople Values =====")
-    print("QUILLOTA__220:", query_values_last_desacople_bool(session_in=session, barra_transmision='QUILLOTA__220'))
-    print("CHARRUA__220:", query_values_last_desacople_bool(session_in=session, barra_transmision='CHARRUA__220'))
-    
-    print("\n===== Testing Latest Status Central =====")
-    print("Quillota:", get_latest_status_central(session_in=session, central_name='Quillota'))
-    
-    session.close()
-    engine.dispose()
+        # First check if session is valid
+        if session_in is None:
+            logger.error("Cannot query status_central: session is None")
+            return pd.DataFrame()
+            
+        # Start the query
+        query = session_in.query(StatusCentral)
+        
+        # Apply central filter if provided
+        if centrals and isinstance(centrals, list):
+            query = query.filter(StatusCentral.central.in_(centrals))
+            
+        # Order by most recent first
+        query = query.order_by(desc(StatusCentral.unix_time))
+        
+        # Apply limit
+        if limit:
+            query = query.limit(limit)
+            
+        # Execute query
+        results = query.all()
+        
+        if results:
+            # Convert to DataFrame
+            data = []
+            for status in results:
+                # Get the associated cost record
+                costo_op = session_in.query(CentralCostoOperacional).filter_by(
+                    id=status.costo_operacional_id).first()
+                
+                # Convert timestamp to datetime for better display
+                try:
+                    fecha = pd.to_datetime(status.timestamp).strftime('%Y-%m-%d')
+                    hora = pd.to_datetime(status.timestamp).strftime('%H:%M:%S')
+                except:
+                    fecha = status.timestamp
+                    hora = ''
+                
+                entry = {
+                    'id': status.id,
+                    'central': status.central,
+                    'barra': status.barra,
+                    'timestamp': status.timestamp,
+                    'fecha': fecha,
+                    'hora': hora,
+                    'unix_time': status.unix_time,
+                    'cmg_timestamp': status.cmg_timestamp,
+                    'cmg_ponderado': float(status.cmg_ponderado),
+                    'status_operacional': status.status_operacional,
+                    'generando': status.status_operacional == 'ON',
+                    'costo_operacional': float(costo_op.costo_operacional) if costo_op else None
+                }
+                data.append(entry)
+                
+            return pd.DataFrame(data)
+        else:
+            logger.warning("No status history found")
+            return pd.DataFrame()
+            
+    except Exception as e:
+        logger.error(f"Error fetching status history: {e}")
+        return pd.DataFrame()
+
+if __name__ == "__main__":
+    # test connection and query manually in here
+    try:
+        engine, metadata = establecer_engine(database='hbsv2', user='cfvallsj', password='Cristianlol720#', host='50.116.33.23', port='3306')
+        session = establecer_session(engine)
+        
+        if session is None:
+            print("ERROR: Could not establish database session. Check connection parameters.")
+            sys.exit(1)
+            
+        # Current timestamp for testing
+        current_time = int(datetime.now().timestamp())
+        yesterday = datetime.now() - timedelta(days=1)
+        yesterday_str = yesterday.strftime('%d.%m.%y')
+        today_str = datetime.now().strftime('%Y-%m-%d')
+        
+        print("\n===== Testing CMG Programados =====")
+        print(get_cmg_programados(session_in=session, name_central='Quillota', date_in=today_str))
+        
+        print("\n===== Testing CMG Ponderado =====")
+        print(query_cmg_ponderado_by_time(session_in=session, unixtime=current_time, delta_hours=24))
+        
+        print("\n===== Testing CMG Tiempo Real =====")
+        try:
+            print(get_cmg_tiempo_real(session_in=session, unix_time_in=current_time - 3600))
+        except TypeError:
+            # Handling the case where the function doesn't accept delta_hours
+            print(get_cmg_tiempo_real(session_in=session, unix_time_in=current_time - 3600))
+        
+        print("\n===== Testing Costo Marginal TCO =====")
+        print("Bloque A:", retrieve_costo_marginal_tco(bloque='A', central='QUINTERO-2_GN_A', session_in=session, date_in=yesterday_str))
+        print("Bloque B:", retrieve_costo_marginal_tco(bloque='B', central='QUINTERO-2_GN_A', session_in=session, date_in=yesterday_str))
+        print("Bloque C:", retrieve_costo_marginal_tco(bloque='C', central='QUINTERO-2_GN_A', session_in=session, date_in=yesterday_str))
+        
+        print("\n===== Testing Factor Penalización =====")
+        print("QUILLOTA_22O:", retrieve_valor_factor_penalizacion(session_in=session, barra_in='QUILLOTA_22O'))
+        print("CHARRUA_22O:", retrieve_valor_factor_penalizacion(session_in=session, barra_in='CHARRUA_22O'))
+        
+        print("\n===== Testing Rio Raw Data =====")
+        print(retrieve_last_entry_from_rio_raw_data(session=session))
+        
+        print("\n===== Testing Tracking Coordinador =====")
+        print(retrieve_tracking_coordinador(session=session))
+        
+        print("\n===== Testing Central Queries =====")
+        print("Last Row for Quillota:", query_last_row_central(session_in=session, name_central='Quillota'))
+        
+        print("\n===== Testing Central Table =====")
+        central_df = query_central_table(session_in=session, num_entries=3)
+        print(f"Retrieved {len(central_df)} centrals")
+        if not central_df.empty:
+            print(central_df[['id', 'nombre', 'barra_transmision']].head())
+        
+        print("\n===== Testing Modified Centrals =====")
+        mod_central_df = query_central_table_modifications(session_in=session, num_entries=3)
+        print(f"Retrieved {len(mod_central_df)} modified centrals")
+        if not mod_central_df.empty:
+            print(mod_central_df[['id', 'nombre', 'external_update']].head())
+        
+        print("\n===== Testing Desacople Status =====")
+        print("QUILLOTA__220:", retrieve_status_desacople(session=session, barra_transmision_in='QUILLOTA__220'))
+        print("CHARRUA__220:", retrieve_status_desacople(session=session, barra_transmision_in='CHARRUA__220'))
+        
+        print("\n===== Testing Last Desacople Values =====")
+        print("QUILLOTA__220:", query_values_last_desacople_bool(session_in=session, barra_transmision='QUILLOTA__220'))
+        print("CHARRUA__220:", query_values_last_desacople_bool(session_in=session, barra_transmision='CHARRUA__220'))
+        
+        print("\n===== Testing Latest Status Central =====")
+        print("Quillota:", get_latest_status_central(session_in=session, central_name='Quillota'))
+        
+        print("\n===== Testing Status Central History =====")
+        status_df = get_status_central_history(session_in=session, limit=50, centrals=['Quillota'])
+        print(status_df)
+        
+        session.close()
+        if engine:
+            engine.dispose()
+            
+    except Exception as e:
+        print(f"ERROR: Test execution failed - {e}")
+        # If session was created, try to close it
+        if 'session' in locals() and session is not None:
+            session.close()
+        # If engine was created, try to dispose it
+        if 'engine' in locals() and engine is not None:
+            engine.dispose()
