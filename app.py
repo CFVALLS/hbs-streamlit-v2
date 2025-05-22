@@ -1051,12 +1051,17 @@ with tab1:
             logging.error(f"Error creating session for status charts: {e}")
     
     # Create and display the pie charts
+    merged_df.head()
     with pie_cols[0]:
-        la_chart = create_status_piechart('Los Angeles', st.session_state['time_range'], status_session)
+        # Pass the dataframe with Los Angeles data
+        la_df = merged_df[merged_df['central'] == 'Los Angeles']
+        la_chart = create_status_piechart(la_df, 'Los Angeles', st.session_state['time_range'])
         st.plotly_chart(la_chart, use_container_width=True)
         
     with pie_cols[1]:
-        q_chart = create_status_piechart('Quillota', st.session_state['time_range'], status_session)
+        # Pass the dataframe with Quillota data
+        q_df = merged_df[merged_df['central'] == 'Quillota']
+        q_chart = create_status_piechart(q_df, 'Quillota', st.session_state['time_range'])
         st.plotly_chart(q_chart, use_container_width=True)
     
     # Add explanatory text

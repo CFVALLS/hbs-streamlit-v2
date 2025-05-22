@@ -431,14 +431,70 @@ def reformat_to_iso(date_string):
     # Return the reformatted string using strftime
     return dt_object.strftime('%Y-%m-%d %H:%M:%S')
 
-def create_status_piechart(central_name, time_range, status_session):
-    # Example: Create a pie chart using Plotly
-
-    # Mock data for illustration
-    data = pd.DataFrame({
-        'Status': ['Active', 'Inactive', 'Maintenance'],
-        'Count': [10, 5, 3]
-    })
-
-    fig = px.pie(data, values='Count', names='Status', title=f'Status for {central_name}')
+def create_status_piechart(merged_df, central_name, time_range=None):
+    """
+    Creates a pie chart showing ON/OFF time distribution for a central.
+    
+    Args:
+        merged_df: DataFrame containing 'Estado' and 'unix_time' columns
+        central_name: Name of the central to display in title
+        time_range: Optional time range description for title
+        
+    Returns:
+        plotly figure object with pie chart
+    """
+    if merged_df.empty:
+        # Return empty chart if no data
+        fig = go.Figure()
+        fig.update_layout(title=f"No status data available for {central_name}")
+        return fig
+    
+    # Ensure data is sorted by time
+    df = merged_df.sort_values('unix_time')
+    
+    # Calculate time durations
+    df['next_time'] = df['unix_time'].shift(-1)
+    
+    # Handle the last row - assume same duration as previous or use a small value
+    if len(df) > 1:
+        # Use same duration as previous row for last entry
+        last_duration = df.iloc[-2]['next_time'] - df.iloc[-2]['unix_time']
+        df.loc[df.index[-1], 'next_time'] = df.iloc[-1]['unix_time'] + last_duration
+    
+    # Calculate duration in seconds for each state
+    df['duration'] = df['next_time'] - df['unix_time']
+    
+    # Filter out any negative durations (which would be errors)
+    df = df[df['duration'] >= 0]
+    
+    # Group by state and sum durations
+    status_summary = df.groupby('status_operacional')['duration'].sum().reset_index()
+    
+    # Convert to hours for better readability
+    status_summary['hours'] = status_summary['duration'] / 3600
+    
+    # Create pie chart
+    colors = {'ON': '#28a745', 'OFF': '#dc3545'}
+    
+    fig = px.pie(
+        status_summary, 
+        values='hours', 
+        names='status_operacional', 
+        title=f'Operational Status for {central_name} {time_range or ""}',
+        color='status_operacional',
+        color_discrete_map=colors
+    )
+    
+    # Improve layout
+    fig.update_traces(
+        textposition='inside', 
+        textinfo='percent+label',
+        hovertemplate='<b>%{label}</b><br>Hours: %{value:.1f}<br>Percentage: %{percent:.1f}%'
+    )
+    
+    fig.update_layout(
+        legend_title='Status',
+        height=400
+    )
+    
     return fig
