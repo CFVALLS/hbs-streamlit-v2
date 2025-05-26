@@ -582,8 +582,8 @@ if engine is not None:
                         })
 
                 # Filter the data for each specific area
-                charrua_filters = ['CHARRUA__220', 'CHARRUA_220', 'CHARRUA_22O', 'CHARRUA']
-                quillota_filters = ['QUILLOTA__220', 'QUILLOTA_220', 'QUILLOTA_22O', 'QUILLOTA']
+                charrua_filters = ['CHARRUA__220', 'CHARRUA_220', 'CHARRUA_22O', 'CHARRUA', 'charrua_22o']
+                quillota_filters = ['QUILLOTA__220', 'QUILLOTA_220', 'QUILLOTA_22O', 'QUILLOTA', 'quillota_22o']
                 
                 # Filter rows for Los Angeles/Charrua
                 cmg_ponderado_la = cmg_ponderado[
@@ -1250,10 +1250,10 @@ with tab3:
             )
             
             if central_seleccion == 'Los Angeles':
-                SELECCIONAR = 'CHARRUA__220'
+                SELECCIONAR = 'charrua_22o'
                 st.markdown('<p style="color: #666; font-size: 0.9rem;">Datos asociados a barra Charrúa</p>', unsafe_allow_html=True)
             else:
-                SELECCIONAR = 'QUILLOTA__220'
+                SELECCIONAR = 'quillota_22o'
                 st.markdown('<p style="color: #666; font-size: 0.9rem;">Datos asociados a barra Quillota</p>', unsafe_allow_html=True)
             
             st.markdown('<p style="margin-top: 1.5rem;"></p>', unsafe_allow_html=True)
@@ -1278,13 +1278,18 @@ with tab3:
             
             # Convert date_calculate to a Unix timestamp
             datetime_obj = datetime.combine(date_calculate, datetime.min.time())
+            # Add timezone info to match chile_datetime
+            datetime_obj = datetime_obj.replace(tzinfo=chile_tz)
             unix_timestamp = int(datetime_obj.timestamp())
-            unix_time_delta = unixtime - unix_timestamp
-            horas_delta = int((unixtime - unix_timestamp) / 3600)  # Convert to integer
             
-            # Show data time range
-            days_diff = (datetime.now().date() - date_calculate).days
-            st.markdown(f'<p style="color: #666; font-size: 0.9rem;">Período seleccionado: {days_diff} días desde {date_calculate.strftime("%d/%m/%Y")}</p>', unsafe_allow_html=True)
+            # Calculate how many hours to query (from selected date to now)
+            current_unix = int(chile_datetime.timestamp())
+            unix_time_delta = current_unix - unix_timestamp
+            horas_delta = max(1, int(unix_time_delta / 3600))  # Ensure at least 1 hour
+            
+            # Show data time range in a more visible way
+            days_diff = (chile_datetime.date() - date_calculate).days
+            st.markdown(f'<div style="background-color: #f0f2f6; padding: 10px; border-radius: 5px; margin-bottom: 10px;"><p><strong>Período seleccionado:</strong> {days_diff} días desde {date_calculate.strftime("%d/%m/%Y")} hasta {chile_datetime.strftime("%d/%m/%Y")}</p><p>Total horas: {horas_delta}</p></div>', unsafe_allow_html=True)
             
         with col2:
             st.markdown('<h3 class="section-title">Descargar Archivos</h3>', unsafe_allow_html=True)
@@ -1294,8 +1299,30 @@ with tab3:
             if Session is not None:
                 try:
                     with session_scope(Session) as session:
-                        cmg_ponderado_descarga = pd.DataFrame(query_cmg_ponderado_by_time(session, unixtime, horas_delta))
-                        cmg_tiempo_real_descarga = pd.DataFrame(get_cmg_tiempo_real(session, unix_time_delta))
+                        # Get the data for the selected date with debug messages
+                        st.info(f"Consultando datos desde {datetime_obj.strftime('%Y-%m-%d')} hasta hoy")
+                        
+                        # Query with clear debug message
+                        st.markdown(f"<p style='font-size:0.8rem; color:gray;'>Solicitando datos para unixtime: {unixtime}, rango: {horas_delta} horas</p>", unsafe_allow_html=True)
+                        
+                        # Get cmg_ponderado data
+                        cmg_ponderado_data = query_cmg_ponderado_by_time(session, unixtime, horas_delta)
+                        cmg_ponderado_descarga = pd.DataFrame(cmg_ponderado_data)
+                        
+                        if not cmg_ponderado_descarga.empty:
+                            st.success(f"Se encontraron {len(cmg_ponderado_descarga)} registros de CMg Ponderado")
+                        else:
+                            st.warning("No se encontraron datos de CMg Ponderado para la fecha seleccionada")
+                            
+                        # Get cmg_tiempo_real data
+                        cmg_tiempo_real_data = get_cmg_tiempo_real(session, unix_time_delta)
+                        cmg_tiempo_real_descarga = pd.DataFrame(cmg_tiempo_real_data)
+                        
+                        if not cmg_tiempo_real_descarga.empty:
+                            st.success(f"Se encontraron {len(cmg_tiempo_real_descarga)} registros de CMg Tiempo Real")
+                        else:
+                            st.warning("No se encontraron datos de CMg Tiempo Real para la fecha seleccionada")
+                            
                 except Exception as e:
                     st.error(f"Error querying data for download: {str(e)}")
                     # Provide empty dataframes if the query fails
@@ -1307,6 +1334,8 @@ with tab3:
                 cmg_ponderado_descarga = pd.DataFrame()
                 cmg_tiempo_real_descarga = pd.DataFrame()
             
+            print(cmg_ponderado_descarga.head())
+            print(cmg_tiempo_real_descarga.head())
             # Preview data
             if not cmg_ponderado_descarga.empty:
                 filtered_data = cmg_ponderado_descarga[cmg_ponderado_descarga['barra_transmision'] == SELECCIONAR]
@@ -1344,8 +1373,29 @@ with tab3:
             def convert_df(df):
                 'seleccionar central a descargar y convertir a csv'
                 # IMPORTANT: Cache the conversion to prevent computation on every rerun
-                df = df[df['barra_transmision'] == SELECCIONAR]
-                return df.to_csv().encode('utf-8')
+                if df.empty:
+                    st.warning(f"No hay datos disponibles para {central_seleccion} en la fecha seleccionada.")
+                    return "".encode('utf-8')
+                
+                # Check if barra_transmision column exists
+                if 'barra_transmision' not in df.columns:
+                    st.warning("Los datos no contienen la columna 'barra_transmision'.")
+                    return df.to_csv().encode('utf-8')
+                
+                # Filter by the selected barra
+                filtered_df = df[df['barra_transmision'] == SELECCIONAR]
+                
+                # Check if any rows match the filter
+                if filtered_df.empty:
+                    st.warning(f"No hay datos para {SELECCIONAR} en la fecha seleccionada.")
+                    # Return all data instead of empty
+                    return df.to_csv().encode('utf-8')
+                
+                return filtered_df.to_csv().encode('utf-8')
+            
+            # Add debug information
+            if cmg_ponderado_descarga.empty:
+                st.error("No se encontraron datos de costos marginales ponderados para la fecha seleccionada.")
             
             csv = convert_df(cmg_ponderado_descarga)
             
@@ -1356,6 +1406,10 @@ with tab3:
                 mime='text/csv',
                 on_click=lambda: add_notification(f"Archivo de costos marginales ponderados para {central_seleccion} descargado", type="success")
             )
+            
+            # Add debug information
+            if cmg_tiempo_real_descarga.empty:
+                st.error("No se encontraron datos de costos marginales en tiempo real para la fecha seleccionada.")
             
             csv_2 = convert_df(cmg_tiempo_real_descarga)
             
