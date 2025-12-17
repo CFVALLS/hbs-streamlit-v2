@@ -1,31 +1,73 @@
 """
-SQLAlchemy ORM models for database tables.
+Módulo que define los modelos ORM para la base de datos.
 """
-from sqlalchemy import Column, Integer, String, Float, Boolean, DateTime, ForeignKey, Text, DECIMAL
-from sqlalchemy.ext.declarative import declarative_base
+# general modules
 import logging
+import os
+import time
+import traceback
+import numpy as np
+import pandas as pd
+from dotenv import load_dotenv
+from datetime import timedelta, datetime
 
-# Configure logger
-logger = logging.getLogger(__name__)
-
-# Try to import MySQL connector, but provide fallback if not available
-try:
-    import mysql.connector
-    from mysql.connector import Error
-    MYSQL_AVAILABLE = True
-except ImportError:
-    logger.warning("MySQL connector not available. Some functionality may be limited.")
-    MYSQL_AVAILABLE = False
+# mysql
+import mysql.connector
+from mysql.connector import Error
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import Table, select, MetaData, desc, asc
 from sqlalchemy import Column, Integer, String, Boolean, Text, DECIMAL, ForeignKey, DateTime, UniqueConstraint, CheckConstraint
-from sqlalchemy.ext.declarative import declarative_base
+from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm.exc import NoResultFound
 from sqlalchemy.orm import relationship, Session
 
+from scripts.utils.utils import setup_logging, get_logger
+
+#########################################################################
+##############                Classes                 ###################
+#########################################################################
+
+# Configurar logger
+logger = get_logger('models_orm', logging.INFO, 'models_orm.log')
+
 Base = declarative_base()
+
+
+class TrackingComunicacion(Base):
+    __tablename__ = 'tracking_comunicacion'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    canal = Column(String(20), nullable=False)  # 'email', 'whatsapp', 'sms', etc.
+    destino = Column(String(255), nullable=False)
+    plantilla = Column(String(100), nullable=True)
+    contenido = Column(Text, nullable=True)
+    timestamp_envio = Column(String(25), nullable=False)
+    unixtime_envio = Column(Integer, nullable=False)
+    exito = Column(Boolean, default=True)
+    respuesta = Column(Text, nullable=True)
+
+    def as_list(self):
+        return [getattr(self, c.name) for c in self.__table__.columns]
+
+def inject_tracking_comunicacion(session, canal, destino, plantilla, contenido, timestamp_envio, unixtime_envio, exito=True, respuesta=None):
+    """
+    Registra un mensaje enviado por un canal (email, whatsapp, etc.).
+    """
+    tracking = TrackingComunicacion(
+        canal=canal,
+        destino=destino,
+        plantilla=plantilla,
+        contenido=contenido,
+        timestamp_envio=timestamp_envio,
+        unixtime_envio=unixtime_envio,
+        exito=exito,
+        respuesta=respuesta
+    )
+    session.add(tracking)
+    session.commit()
+    return tracking
 
 class TrackingCoordinador(Base):
     """
@@ -315,26 +357,42 @@ class TrackingEmail(Base):
 class TrackingDesacople(Base):
     """
     Representa la tabla 'tracking_desacople' en la base de datos.
-
-    Atributos:
-        id (int): Es la clave primaria de la tabla con auto-incremento.
-        central (str): Nombre de la central. En MySQL se utiliza 'tinytext' que puede representarse como un String en SQLAlchemy.
-        zona_en_desacople (bool): Un valor booleano para indicar el estado de la zona de desacople.
-        timestamp_mov_zona_desacople (str): Representa el timestamp del cambio de estado de la zona de desacople. En MySQL se utiliza 'tinytext' que puede representarse como un String en SQLAlchemy.
     """
     __tablename__ = 'tracking_desacople'
 
     id = Column(Integer, primary_key=True, autoincrement=True)
-    central = Column(String(40), nullable=False)
+    barra_transmision = Column(String(40), nullable=False)
     zona_en_desacople = Column(Boolean, nullable=False)
-    timestamp_mov_zona_desacople = Column(String(17))
+    tramo_desacople = Column(String(255))
+    timestamp_mov_zona_desacople = Column(String(25))
 
     def as_list(self):
-        "return a list representation of the object"
+        return [getattr(self, c.name) for c in self.__table__.columns]
+
+
+class DesacopleHistory(Base):
+    """
+    Guarda el último evento detectado (acople/desacople) por barra en escaneos retrospectivos.
+    """
+    __tablename__ = 'desacople_history'
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    barra_transmision = Column(String(255), nullable=False)
+    estado = Column(String(20), nullable=False)  # 'acople' | 'desacople'
+    detected_at = Column(DateTime, nullable=False)
+    tramo = Column(String(255), nullable=True)
+    comentario = Column(Text, nullable=True)
+    fuente = Column(String(255), nullable=True)  # Nombre del archivo u origen del dato
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    def as_list(self):
         return [getattr(self, c.name) for c in self.__table__.columns]
     
 class FactorPenalizacion(Base):
     __tablename__ = 'factor_penalizacion'
+    __table_args__ = (
+        UniqueConstraint('fecha', 'barra', 'hora', name='uq_fp_fecha_barra_hora'),
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     fecha = Column(String(40), nullable=False)
@@ -348,6 +406,9 @@ class FactorPenalizacion(Base):
 
 class TrackingTco(Base):
    __tablename__ = 'tracking_tco'
+   __table_args__ = (
+       UniqueConstraint('fecha', 'central', 'bloque_horario', name='uq_tco_fecha_central_bloque'),
+   )
 
    id = Column(Integer, primary_key=True, autoincrement=True)
    fecha = Column(String(17), nullable=False)

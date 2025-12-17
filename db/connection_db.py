@@ -1,109 +1,97 @@
 """
-Database connection utilities for the application.
+Módulo para establecer la conexión a la base de datos.
 """
+import os
+import sys
+# Add the project root to the Python path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, Session
 import logging
 from contextlib import contextmanager
-from sqlalchemy import create_engine, MetaData
-from sqlalchemy.orm import sessionmaker, scoped_session
-from sqlalchemy.exc import SQLAlchemyError
+from scripts.utils.utils import setup_logging, get_date
 
-def establecer_engine(database, user, password, host, port, verbose=False):
+# Configurar logger
+logger = setup_logging(log_name='connection_db', log_level=logging.INFO, log_filename='connection_db.log')
+
+def establecer_engine(database_url=None):
     """
-    Establishes a connection to the database and returns the engine and metadata.
+    Establece y retorna un engine de SQLAlchemy.
     
     Args:
-        database (str): Database name
-        user (str): Database user
-        password (str): Database password
-        host (str): Database host
-        port (str): Database port
-        verbose (bool): Whether to print verbose output
-        
+        database_url (str): URL de conexión a la base de datos. Si es None, 
+                           se usa la variable de entorno DB_CONNECTION_STRING
+                           o una URL por defecto.
+    
     Returns:
-        tuple: (engine, metadata) if successful, (None, None) if connection fails
+        Engine: Engine de SQLAlchemy
     """
     try:
-        # Create SQLAlchemy engine
-        engine_string = f"mysql+pymysql://{user}:{password}@{host}:{port}/{database}"
+        # Obtener URL de conexión
+        if database_url is None:
+            # Try to get from environment variable first
+            database_url = os.getenv("DB_CONNECTION_STRING")
+            
+            # If not set, try to construct from individual environment variables
+            if database_url is None:
+                db_user = os.getenv("DB_USER", "admin")
+                db_password = os.getenv("DB_USER_PASSWORD", "")
+                db_host = os.getenv("DB_HOST", "172.27.144.1")
+                db_port = os.getenv("DB_PORT", "3306")
+                db_name = os.getenv("DB_DATABASE", "hbsv2")
+                
+                # Construct MySQL connection string
+                database_url = f"mysql+pymysql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+                
+                # If still not set, use SQLite as fallback
+                if not all([db_user, db_host, db_name]):
+                    database_url = "sqlite:///cmg_db.sqlite"
+                    logger.warning("Using SQLite as fallback database")
         
-        if verbose:
-            logging.info(f"Connecting to database: {host}:{port}/{database}")
-        
-        engine = create_engine(
-            engine_string,
-            pool_size=5,
-            max_overflow=10,
-            pool_timeout=30,
-            pool_recycle=3600,
-            echo=False
-        )
-        
-        # Test connection
-        with engine.connect() as conn:
-            if verbose:
-                logging.info("Database connection successful")
-        
-        # Create metadata
-        metadata = MetaData()
-        metadata.reflect(bind=engine)
-        
-        return engine, metadata
-    
-    except SQLAlchemyError as e:
-        logging.error(f"Database connection error: {str(e)}")
-        return None, None
+        # Crear engine
+        engine = create_engine(database_url)
+        logger.info(f"Engine establecido con éxito: {database_url}")
+        return engine
     
     except Exception as e:
-        logging.error(f"Unexpected error connecting to database: {str(e)}")
-        return None, None
+        logger.error(f"Error al establecer engine: {e}")
+        raise
 
 def establecer_session(engine):
     """
-    Creates a session factory for the given engine.
+    Establece y retorna una sesión de SQLAlchemy.
     
     Args:
-        engine: SQLAlchemy engine
-        
+        engine (Engine): Engine de SQLAlchemy
+    
     Returns:
-        function: Session factory function or None if engine is None
+        Session: Sesión de SQLAlchemy
     """
-    if engine is None:
-        logging.error("Cannot create session with null engine")
-        return None
-    
     try:
-        # Create session factory
-        session_factory = sessionmaker(bind=engine)
-        Session = scoped_session(session_factory)
+        # Crear sessionmaker
+        SessionMaker = sessionmaker(bind=engine)
         
-        return Session
-    
-    except SQLAlchemyError as e:
-        logging.error(f"Error creating session: {str(e)}")
-        return None
+        # Crear sesión
+        session = SessionMaker()
+        logger.info("Sesión establecida con éxito")
+        return session
     
     except Exception as e:
-        logging.error(f"Unexpected error creating session: {str(e)}")
-        return None
+        logger.error(f"Error al establecer sesión: {e}")
+        raise
 
 @contextmanager
-def session_scope(session_factory):
+def session_scope(session: Session):
     """
-    Provides a transactional scope for a series of operations.
-    
-    Args:
-        session_factory: SQLAlchemy session factory
-        
-    Yields:
-        session: Active SQLAlchemy session
+    Context manager to provide a transactional scope around a series of operations.
+    Accepts an existing session and ensures proper close/rollback semantics.
     """
-    session = session_factory()
     try:
         yield session
         session.commit()
-    except SQLAlchemyError as e:
+    except Exception:
         session.rollback()
-        logging.error(f"Database transaction error: {str(e)}")
         raise
     finally:
         session.close()

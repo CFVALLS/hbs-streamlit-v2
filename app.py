@@ -11,6 +11,7 @@ import base64
 import io
 import requests
 from datetime import datetime, timedelta
+from pathlib import Path
 import plotly.express as px
 import plotly.graph_objects as go
 import logging
@@ -44,8 +45,10 @@ except (IOError, PermissionError) as e:
 logger = logging.getLogger("streamlit_app")
 logger.setLevel(logging.INFO)  # Set to INFO level for normal operation, can be changed to DEBUG for troubleshooting
 
-# Add the parent directory to the path
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Ensure the app directory is on the path for local imports
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+if APP_DIR not in sys.path:
+    sys.path.insert(0, APP_DIR)
 
 # Import our own modules
 from db.operaciones_db import (
@@ -59,7 +62,8 @@ from db.operaciones_db import (
     query_central_table,
     query_central_table_modifications,
     get_latest_status_central,
-    get_status_central_history
+    get_status_central_history,
+    get_latest_desacople_event
 )
 
 from db.connection_db import establecer_engine, establecer_session, session_scope
@@ -126,57 +130,87 @@ st.set_page_config(
 # Custom CSS styles for a cleaner, more modern look
 st.markdown("""
 <style>
+    :root {
+        --bg: #f5f7fb;
+        --panel: #ffffff;
+        --panel-2: #f0f4ff;
+        --accent: #2563eb;
+        --accent-2: #22c55e;
+        --muted: #6b7280;
+        --text: #0f172a;
+        --border: #e5e7eb;
+        --shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
+    }
+    body {
+        background: radial-gradient(120% 120% at 10% 20%, #f6f8ff 0%, #eef2ff 40%, #f5f7fb 100%);
+        font-family: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
+        color: var(--text);
+    }
     .main {
         padding: 1rem 2rem;
+        background: transparent;
     }
     .stTabs [data-baseweb="tab-list"] {
-        gap: 2rem;
+        gap: 1rem;
+        border-bottom: 1px solid var(--border);
     }
     .stTabs [data-baseweb="tab"] {
         font-size: 1rem;
-        font-weight: 600;
+        font-weight: 700;
+        color: var(--muted);
+        padding: 0.75rem 1rem;
+    }
+    .stTabs [aria-selected="true"] {
+        color: var(--text);
+        border-bottom: 2px solid var(--accent);
     }
     .metric-card {
-        background-color: #f8f9fa;
-        border-radius: 0.5rem;
+        background: linear-gradient(145deg, var(--panel), var(--panel-2));
+        border: 1px solid var(--border);
+        border-radius: 12px;
         padding: 1rem;
-        box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075);
+        box-shadow: var(--shadow);
     }
     .metric-value {
-        font-size: 1.75rem;
-        font-weight: 700;
-        margin-bottom: 0.25rem;
+        font-size: 1.6rem;
+        font-weight: 800;
+        margin-bottom: 0.15rem;
+        color: var(--text);
     }
     .metric-label {
-        font-size: 0.875rem;
-        color: #555;
+        font-size: 0.85rem;
+        color: var(--muted);
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
     }
     .status-active {
-        color: #00b300;
-        font-weight: bold;
-        font-size: 1.5rem; /* Increased from default size */
+        color: #22c55e;
+        font-weight: 800;
+        font-size: 1.5rem;
     }
     .status-inactive {
-        color: #cc0000;
-        font-weight: bold;
-        font-size: 1.5rem; /* Increased from default size */
+        color: #ef4444;
+        font-weight: 800;
+        font-size: 1.5rem;
     }
     .section-title {
-        font-size: 1.5rem;
-        font-weight: 700;
+        font-size: 1.45rem;
+        font-weight: 800;
         margin-bottom: 1rem;
-        color: #0e1117;
+        color: #0f172a;
+        letter-spacing: -0.01em;
     }
     .card-container {
-        background-color: white;
-        border-radius: 0.5rem;
-        padding: 1.5rem;
-        box-shadow: 0 0.125rem 0.5rem rgba(0, 0, 0, 0.05);
-        margin-bottom: 1.5rem;
+        background: linear-gradient(160deg, var(--panel), #f7f9fe);
+        border-radius: 14px;
+        padding: 1.35rem;
+        border: 1px solid var(--border);
+        box-shadow: var(--shadow);
+        margin-bottom: 1.35rem;
     }
     .divider {
         height: 1px;
-        background-color: #eee;
+        background: linear-gradient(90deg, transparent, #e5e7eb, transparent);
         margin: 1.5rem 0;
     }
     /* Fix for empty containers */
@@ -196,7 +230,7 @@ st.markdown("""
     .tooltip::after {
         content: "ⓘ";
         font-size: 0.8rem;
-        color: #1E88E5;
+        color: var(--accent-2);
         margin-left: 0.25rem;
     }
     .tooltip:hover::before {
@@ -205,60 +239,31 @@ st.markdown("""
         bottom: 100%;
         left: 50%;
         transform: translateX(-50%);
-        padding: 0.5rem;
-        background-color: #333;
+        padding: 0.5rem 0.75rem;
+        background-color: #0f172a;
         color: white;
-        border-radius: 0.25rem;
+        border-radius: 0.35rem;
         white-space: nowrap;
         z-index: 1000;
-        font-size: 0.75rem;
-        box-shadow: 0 0.25rem 0.5rem rgba(0, 0, 0, 0.2);
+        font-size: 0.78rem;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+        border: 1px solid #1f2937;
     }
-    /* Dark mode styles */
-    .dark-mode {
-        background-color: #121212;
-        color: #e0e0e0;
-    }
-    
-    .dark-mode .metric-card {
-        background-color: #1e1e1e;
-        color: #e0e0e0;
-    }
-    
-    .dark-mode .card-container {
-        background-color: #1e1e1e;
-        color: #e0e0e0;
-    }
-    
-    .dark-mode .section-title {
-        color: #e0e0e0;
-    }
-    
-    .dark-mode .divider {
-        background-color: #333;
-    }
-    
     /* Mobile optimizations */
     @media (max-width: 768px) {
         .metric-card {
-            padding: 0.5rem;
+            padding: 0.75rem;
             margin-bottom: 0.5rem;
         }
-        
         .metric-value {
-            font-size: 1.25rem;
+            font-size: 1.3rem;
         }
-        
         .card-container {
             padding: 1rem;
         }
-        
         .section-title {
-            font-size: 1.25rem;
+            font-size: 1.2rem;
         }
-    }
-    body {
-        font-family: 'Roboto', sans-serif;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -281,21 +286,80 @@ hora_redondeada_cmg_programados = f'{hora[0]}:00'
 naive_datetime = chile_datetime.astimezone().replace(tzinfo=None)
 unixtime = int(time.mktime(naive_datetime.timetuple()))
 
-# Credenciales mysql remoto
-DATABASE = st.secrets["AWS_MYSQL"]["DATABASE"]
-HOST = st.secrets["AWS_MYSQL"]["HOST"]
-USER = st.secrets["AWS_MYSQL"]["USER"]
-PASSWORD = st.secrets["AWS_MYSQL"]["USER_PASSWORD"]
-PORT = st.secrets["AWS_MYSQL"]["PORT"]
-USER_KEY = st.secrets["COORDINADOR"]["USER_KEY"]
+# Safe access to secrets (avoid crash when secrets.toml is missing)
+def get_secret_section(section_name: str) -> dict:
+    try:
+        return dict(st.secrets[section_name])
+    except Exception:
+        # Fallback to local secrets file if Streamlit secrets are unavailable
+        return load_local_secrets().get(section_name, {})
 
-#Informacion API flask
-API_HOST = st.secrets["API"]["HOST"]
-API_PORT = st.secrets["API"]["PORT"]
+def load_local_secrets():
+    """
+    Load secrets from a local .streamlit/secrets.toml if present (useful for local dev).
+    """
+    paths = [
+        Path(__file__).resolve().parent / ".streamlit" / "secrets.toml",
+        Path(__file__).resolve().parent.parent / ".streamlit" / "secrets.toml",
+    ]
+    for p in paths:
+        if p.exists():
+            try:
+                try:
+                    import tomllib  # Python 3.11+
+                    return tomllib.loads(p.read_text())
+                except ImportError:
+                    import toml  # type: ignore
+                    return toml.load(str(p))
+            except Exception:
+                return {}
+    return {}
+
+# Credenciales mysql remoto con fallback local para desarrollo
+def load_db_config():
+    # Prefer Streamlit secrets if available
+    secrets = get_secret_section("AWS_MYSQL")
+    if secrets:
+        return {
+            "DATABASE": secrets.get("DATABASE"),
+            "HOST": secrets.get("HOST"),
+            "USER": secrets.get("USER"),
+            "PASSWORD": secrets.get("USER_PASSWORD", ""),
+            "PORT": secrets.get("PORT", "3306"),
+        }
+    
+    # Fallback: environment variables or local Laragon defaults
+    return {
+        "DATABASE": os.getenv("DB_DATABASE", "hbsv2"),
+        "HOST": os.getenv("DB_HOST", "172.27.144.1"),
+        "USER": os.getenv("DB_USER", "admin"),
+        "PASSWORD": os.getenv("DB_USER_PASSWORD", ""),
+        "PORT": os.getenv("DB_PORT", "3306"),
+    }
+
+db_conf = load_db_config()
+DATABASE = db_conf["DATABASE"]
+HOST = db_conf["HOST"]
+USER = db_conf["USER"]
+PASSWORD = db_conf["PASSWORD"]
+PORT = db_conf["PORT"]
+
+# API key (still optional)
+USER_KEY = get_secret_section("COORDINADOR").get("USER_KEY", os.getenv("COORDINADOR_USER_KEY", ""))
+
+#Informacion API flask (optional; fallback to env/default localhost)
+API_HOST = get_secret_section("API").get("HOST", os.getenv("API_HOST", "localhost"))
+API_PORT = get_secret_section("API").get("PORT", os.getenv("API_PORT", "8000"))
 
 
-# Establecer motor de base de datos
-engine, metadata = establecer_engine(DATABASE, USER, PASSWORD, HOST, PORT, verbose=True)
+# Establecer motor de base de datos (cacheado para evitar recrearlo en cada rerun)
+@st.cache_resource(show_spinner=False)
+def get_engine():
+    db_url = f"mysql+pymysql://{USER}:{PASSWORD}@{HOST}:{PORT}/{DATABASE}"
+    # establecer_engine de este proyecto acepta un string de conexión; construimos aquí para compatibilidad
+    return establecer_engine(db_url)
+
+engine = get_engine()
 session = establecer_session(engine)
 
 
@@ -328,6 +392,27 @@ costo_operacional_q_base = 0.0
 row_cmg_la = 0.0
 row_cmg_quillota = 0.0
 
+# Cacheable fetchers to reduce repeated DB reads on reruns
+@st.cache_data(show_spinner=False, ttl=60)
+def get_cmg_ponderado_cached(unixtime_in: int, time_range_hours: int):
+    """Fetch cmg ponderado data for a time window; cached for 60s to avoid re-querying every rerun."""
+    local_engine = get_engine()
+    SessionLocal = establecer_session(local_engine)
+    with session_scope(SessionLocal) as session:
+        df = pd.DataFrame(query_cmg_ponderado_by_time(session, unixtime_in, time_range_hours))
+    return df.copy()
+
+@st.cache_data(show_spinner=False, ttl=60)
+def get_cmg_programados_cached(name_central: str, date_in: str, conn_status: bool, api_host: str, api_port: str):
+    """Cache CMg programados per central/date for 60s to avoid repeated calls."""
+    if conn_status:
+        SessionLocal = establecer_session(get_engine())
+        with session_scope(SessionLocal) as session:
+            result = get_cmg_programados(name_central, date_in=date_in, session=session)
+    else:
+        result = get_cmg_programados(name_central, date_in=date_in, host=api_host, port=api_port)
+    return result.copy() if isinstance(result, dict) else result
+
 #############################################################
 ###################  Consultas    ###########################
 #############################################################
@@ -337,6 +422,9 @@ if engine is not None:
     if Session is not None:
         try:
             with session_scope(Session) as session:
+                # Latest desacople events per barra
+                desacople_event_charrua = get_latest_desacople_event(session, 'CHARRUA__220') or {}
+                desacople_event_quillota = get_latest_desacople_event(session, 'QUILLOTA__220') or {}
                 # last row tracking_cmg
                 tracking_cmg_last_row = retrieve_tracking_coordinador(session)
                 ultimo_tracking = tracking_cmg_last_row[1]
@@ -363,7 +451,7 @@ if engine is not None:
                 cmg_quillota = round(float(cmg_quillota), 2)
                 
                 # consulta de datos cmg_ponderado 48 horas previas
-                cmg_ponderado_96h = pd.DataFrame(query_cmg_ponderado_by_time(session, unixtime, st.session_state['time_range']))
+                cmg_ponderado_96h = get_cmg_ponderado_cached(unixtime, st.session_state['time_range'])
                 # Try multiple date formats to handle mixed formats
                 if not cmg_ponderado_96h.empty and 'timestamp' in cmg_ponderado_96h.columns:
                     # Ensure timestamp column is string type
@@ -532,14 +620,20 @@ if engine is not None:
                     estado_generacion_la = status_la == 'ON' if status_la else False
                     estado_generacion_q = status_q == 'ON' if status_q else False
                     
+                    def safe_float(value):
+                        try:
+                            return float(value)
+                        except (TypeError, ValueError):
+                            return 0.0
+
                     # Access costo_operacional directly from index 9 where it's stored in the result
-                    costo_operacional_la = round(float(last_row_la[9]), 2) if last_row_la and len(last_row_la) > 9 and last_row_la[9] is not None else 0.0
+                    costo_operacional_la = round(safe_float(last_row_la[9]), 2) if last_row_la and len(last_row_la) > 9 else 0.0
                     # Validate that we have factor_motor at index 10
-                    factor_motor_la = round(float(last_row_la[10]), 2) if last_row_la and len(last_row_la) > 10 and last_row_la[10] is not None else 0.0
+                    factor_motor_la = round(safe_float(last_row_la[10]), 2) if last_row_la and len(last_row_la) > 10 else 0.0
                     costo_operacional_la_base = costo_operacional_la - factor_motor_la if costo_operacional_la > 0 else 0.0
                     
-                    costo_operacional_q = round(float(last_row_q[9]), 2) if last_row_q and len(last_row_q) > 9 and last_row_q[9] is not None else 0.0
-                    factor_motor_q = round(float(last_row_q[10]), 2) if last_row_q and len(last_row_q) > 10 and last_row_q[10] is not None else 0.0
+                    costo_operacional_q = round(safe_float(last_row_q[9]), 2) if last_row_q and len(last_row_q) > 9 else 0.0
+                    factor_motor_q = round(safe_float(last_row_q[10]), 2) if last_row_q and len(last_row_q) > 10 else 0.0
                     costo_operacional_q_base = costo_operacional_q - factor_motor_q if costo_operacional_q > 0 else 0.0
                     
                     # Log the retrieved values
@@ -660,8 +754,8 @@ else:
 
 ############# Queries externas #############
 # Use direct database access by passing the session parameter
-cmg_programados_quillota = get_cmg_programados('Quillota', date_in=fecha, session=session) if CONN_STATUS else get_cmg_programados('Quillota', date_in=fecha, host=API_HOST, port=API_PORT)
-cmg_programados_la = get_cmg_programados('Los Angeles', date_in=fecha, session=session) if CONN_STATUS else get_cmg_programados('Los Angeles', date_in=fecha, host=API_HOST, port=API_PORT)
+cmg_programados_quillota = get_cmg_programados_cached('Quillota', fecha, CONN_STATUS, API_HOST, API_PORT)
+cmg_programados_la = get_cmg_programados_cached('Los Angeles', fecha, CONN_STATUS, API_HOST, API_PORT)
 cmg_online = get_costo_marginal_online_hora(fecha_gte=fecha, fecha_lte=fecha, barras=['Quillota', 'Charrua'], hora_in=hora_redondeada, user_key=USER_KEY)
 
 # check if cmg_online is empty
@@ -692,11 +786,10 @@ with tab1:
         try:
             with session_scope(Session) as session:
                 # Modify this to respect the time range setting
-                cmg_ponderado_96h_update = pd.DataFrame(query_cmg_ponderado_by_time(
-                    session, 
-                    unixtime, 
+                cmg_ponderado_96h_update = get_cmg_ponderado_cached(
+                    unixtime,
                     st.session_state['time_range']  # Use the selected time range instead of fixed 96
-                ))
+                )
                 
                 # Only update the global variable if we got valid data
                 if not cmg_ponderado_96h_update.empty:
@@ -708,8 +801,24 @@ with tab1:
 
     ################## DATOS Centrales ##############################################
     # Create a unified card template for both locations
+    def friendly_delta(dt):
+        """Return a short human delta like 'hace 2h'."""
+        if not hasattr(dt, 'timestamp'):
+            return "N/D"
+        delta = datetime.now() - dt
+        minutes = int(delta.total_seconds() // 60)
+        if minutes < 1:
+            return "hace instantes"
+        if minutes < 60:
+            return f"hace {minutes}m"
+        hours = minutes // 60
+        if hours < 48:
+            return f"hace {hours}h"
+        days = hours // 24
+        return f"hace {days}d"
+
     def display_central_card(name, estado_generacion, cmg_calculado, costo_operacional, cmg_online, 
-                           cmg_programado, central_referencia, afecto_desacople, hora_redondeada):
+                           cmg_programado, central_referencia, afecto_desacople, hora_redondeada, desacople_event):
         """Create a unified card for central data display"""
         # Card container with consistent styling
         st.markdown(f'<h2 class="section-title" style="text-align: center;">{name}</h2>', unsafe_allow_html=True)
@@ -768,6 +877,19 @@ with tab1:
         </div>
         ''', unsafe_allow_html=True)
 
+        # Desacople history summary
+        if desacople_event:
+            evento_estado = (desacople_event.get("estado") or "N/D").upper()
+            evento_fecha = desacople_event.get("detected_at")
+            fecha_txt = evento_fecha.strftime('%Y-%m-%d %H:%M') if hasattr(evento_fecha, 'strftime') else str(evento_fecha) or "N/D"
+            delta_txt = friendly_delta(evento_fecha) if hasattr(evento_fecha, 'timestamp') else "N/D"
+            cols_history = st.columns(2)
+            metric_card(cols_history[0], "Último evento desacople", evento_estado)
+            metric_card(cols_history[1], "Cuándo", f"{fecha_txt} · {delta_txt}")
+        else:
+            cols_history = st.columns(1)
+            metric_card(cols_history[0], "Último evento desacople", "Sin registros")
+
     # Display the two central cards in a two-column layout
     central_cols = st.columns(2)
     
@@ -781,7 +903,8 @@ with tab1:
             cmg_programado=cmg_programados_la,
             central_referencia=central_referencia_charrua,
             afecto_desacople=afecto_desacople_charrua,
-            hora_redondeada=hora_redondeada
+            hora_redondeada=hora_redondeada,
+            desacople_event=desacople_event_charrua
         )
     
     with central_cols[1]:
@@ -794,7 +917,8 @@ with tab1:
             cmg_programado=cmg_programados_quillota,
             central_referencia=central_referencia_quillota,
             afecto_desacople=afecto_desacople_quillota,
-            hora_redondeada=hora_redondeada
+            hora_redondeada=hora_redondeada,
+            desacople_event=desacople_event_quillota
         )
 
     ################## GRAFICO ##################
@@ -1293,49 +1417,53 @@ with tab3:
             
         with col2:
             st.markdown('<h3 class="section-title">Descargar Archivos</h3>', unsafe_allow_html=True)
-            
-            # Process the data for download
-            Session = establecer_session(engine)
-            if Session is not None:
-                try:
-                    with session_scope(Session) as session:
-                        # Get the data for the selected date with debug messages
-                        st.info(f"Consultando datos desde {datetime_obj.strftime('%Y-%m-%d')} hasta hoy")
-                        
-                        # Query with clear debug message
-                        st.markdown(f"<p style='font-size:0.8rem; color:gray;'>Solicitando datos para unixtime: {unixtime}, rango: {horas_delta} horas</p>", unsafe_allow_html=True)
-                        
-                        # Get cmg_ponderado data
-                        cmg_ponderado_data = query_cmg_ponderado_by_time(session, unixtime, horas_delta)
-                        cmg_ponderado_descarga = pd.DataFrame(cmg_ponderado_data)
-                        
-                        if not cmg_ponderado_descarga.empty:
-                            st.success(f"Se encontraron {len(cmg_ponderado_descarga)} registros de CMg Ponderado")
-                        else:
-                            st.warning("No se encontraron datos de CMg Ponderado para la fecha seleccionada")
+
+            # Initialize cached download data in session state
+            if 'cmg_ponderado_descarga' not in st.session_state:
+                st.session_state['cmg_ponderado_descarga'] = pd.DataFrame()
+            if 'cmg_tiempo_real_descarga' not in st.session_state:
+                st.session_state['cmg_tiempo_real_descarga'] = pd.DataFrame()
+
+            # Run the expensive queries only when requested
+            fetch_data = st.button("Consultar datos", type="primary", use_container_width=True)
+
+            if fetch_data:
+                Session = establecer_session(engine)
+                if Session is not None:
+                    try:
+                        with session_scope(Session) as session:
+                            st.info(f"Consultando datos desde {datetime_obj.strftime('%Y-%m-%d')} hasta hoy")
+                            st.markdown(f"<p style='font-size:0.8rem; color:gray;'>Solicitando datos para unixtime: {unixtime}, rango: {horas_delta} horas</p>", unsafe_allow_html=True)
                             
-                        # Get cmg_tiempo_real data
-                        cmg_tiempo_real_data = get_cmg_tiempo_real(session, unix_time_delta)
-                        cmg_tiempo_real_descarga = pd.DataFrame(cmg_tiempo_real_data)
-                        
-                        if not cmg_tiempo_real_descarga.empty:
-                            st.success(f"Se encontraron {len(cmg_tiempo_real_descarga)} registros de CMg Tiempo Real")
-                        else:
-                            st.warning("No se encontraron datos de CMg Tiempo Real para la fecha seleccionada")
+                            cmg_ponderado_descarga = get_cmg_ponderado_cached(unixtime, horas_delta)
                             
-                except Exception as e:
-                    st.error(f"Error querying data for download: {str(e)}")
-                    # Provide empty dataframes if the query fails
-                    cmg_ponderado_descarga = pd.DataFrame()
-                    cmg_tiempo_real_descarga = pd.DataFrame()
-            else:
-                st.warning("Could not create database session for data download.")
-                # Provide empty dataframes
-                cmg_ponderado_descarga = pd.DataFrame()
-                cmg_tiempo_real_descarga = pd.DataFrame()
-            
-            print(cmg_ponderado_descarga.head())
-            print(cmg_tiempo_real_descarga.head())
+                            cmg_tiempo_real_data = get_cmg_tiempo_real(session, unix_time_delta)
+                            cmg_tiempo_real_descarga = pd.DataFrame(cmg_tiempo_real_data)
+                            
+                            st.session_state['cmg_ponderado_descarga'] = cmg_ponderado_descarga
+                            st.session_state['cmg_tiempo_real_descarga'] = cmg_tiempo_real_descarga
+                            
+                            if cmg_ponderado_descarga.empty:
+                                st.warning("No se encontraron datos de CMg Ponderado para la fecha seleccionada")
+                            else:
+                                st.success(f"Se encontraron {len(cmg_ponderado_descarga)} registros de CMg Ponderado")
+                            
+                            if cmg_tiempo_real_descarga.empty:
+                                st.warning("No se encontraron datos de CMg Tiempo Real para la fecha seleccionada")
+                            else:
+                                st.success(f"Se encontraron {len(cmg_tiempo_real_descarga)} registros de CMg Tiempo Real")
+                    except Exception as e:
+                        st.error(f"Error querying data for download: {str(e)}")
+                        st.session_state['cmg_ponderado_descarga'] = pd.DataFrame()
+                        st.session_state['cmg_tiempo_real_descarga'] = pd.DataFrame()
+                else:
+                    st.warning("No se pudo crear sesión de base de datos para la descarga.")
+                    st.session_state['cmg_ponderado_descarga'] = pd.DataFrame()
+                    st.session_state['cmg_tiempo_real_descarga'] = pd.DataFrame()
+
+            cmg_ponderado_descarga = st.session_state['cmg_ponderado_descarga']
+            cmg_tiempo_real_descarga = st.session_state['cmg_tiempo_real_descarga']
+
             # Preview data
             if not cmg_ponderado_descarga.empty:
                 filtered_data = cmg_ponderado_descarga[cmg_ponderado_descarga['barra_transmision'] == SELECCIONAR]
@@ -1345,6 +1473,8 @@ with tab3:
                     use_container_width=True,
                     height=150
                 )
+            else:
+                st.info("Presiona \"Consultar datos\" para obtener y previsualizar resultados.")
             
             # Style the download buttons
             st.markdown("""
@@ -1638,73 +1768,3 @@ st.markdown("""
 
 # Show any active notifications
 show_notifications()
-
-# Add this function to calculate ON/OFF statistics and create pie charts
-def create_status_piechart(central_name, time_range_hours, session=None):
-    """
-    Creates a pie chart showing ON/OFF time distribution for a central
-    
-    Args:
-        central_name: Name of the central ('Los Angeles' or 'Quillota')
-        time_range_hours: Number of hours to look back
-        session: Database session
-        
-    Returns:
-        Plotly pie chart figure
-    """
-    if session is None:
-        # Mock data if no session or for testing
-        if central_name == 'Los Angeles':
-            # Example distribution for Los Angeles
-            on_percent = 65
-            off_percent = 35
-        else:
-            # Example distribution for Quillota
-            on_percent = 40
-            off_percent = 60
-    else:
-        try:
-            # Get current status since we don't have history
-            current_status = get_latest_status_central(session, central_name)
-            
-            # Generate reasonable mock data based on current status
-            if current_status == 'ON':
-                on_percent = 75
-                off_percent = 25
-            else:
-                on_percent = 30
-                off_percent = 70
-                
-        except Exception as e:
-            logging.error(f"Error getting status for {central_name}: {e}")
-            # Fallback values
-            on_percent = 50
-            off_percent = 50
-    
-    # Create the pie chart
-    labels = ['ENCENDIDO', 'APAGADO']
-    values = [on_percent, off_percent]
-    colors = ['#00b300', '#cc0000']  # Green for ON, Red for OFF - matching our status colors
-    
-    fig = go.Figure(data=[go.Pie(
-        labels=labels,
-        values=values,
-        hole=.4,  # Create a donut chart
-        marker=dict(colors=colors),
-        textinfo='label+percent',
-        insidetextorientation='radial',
-        pull=[0.05, 0],  # Pull the first slice (ON) slightly out
-        hoverinfo='label+percent',
-        textfont=dict(size=14, color='white'),
-    )])
-    
-    fig.update_layout(
-        title_text=f"Estado de {central_name}",
-        title_x=0.5,  # Center the title
-        title_font=dict(size=16),
-        showlegend=False,
-        margin=dict(t=30, b=10, l=10, r=10),
-        height=250,
-    )
-    
-    return fig
