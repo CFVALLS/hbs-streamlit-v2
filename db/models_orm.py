@@ -372,9 +372,12 @@ class TrackingDesacople(Base):
 
 class DesacopleHistory(Base):
     """
-    Guarda el último evento detectado (acople/desacople) por barra en escaneos retrospectivos.
+    Guarda el historial de eventos detectados (acople/desacople) por barra.
     """
     __tablename__ = 'desacople_history'
+    __table_args__ = (
+        UniqueConstraint('barra_transmision', 'estado', 'detected_at', 'tramo', name='uq_desacople_history_evento'),
+    )
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     barra_transmision = Column(String(255), nullable=False)

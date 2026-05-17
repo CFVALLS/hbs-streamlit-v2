@@ -1058,7 +1058,7 @@ with tab1:
                     )
             
             # Show the Plotly figure in Streamlit with a consistent container width
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
             
             # Add a caption with data summary
             if not plot_data.empty and 'timestamp' in plot_data.columns:
@@ -1095,7 +1095,7 @@ with tab1:
             # Show the dataframe with better column configuration
             st.dataframe(
                 displayed_data, 
-                use_container_width=True, 
+                width="stretch", 
                 height=300,
                 column_config={
                     "Fecha y Hora": st.column_config.DatetimeColumn(
@@ -1115,7 +1115,7 @@ with tab1:
             # Add export options for the data
             export_cols = st.columns(2)
             with export_cols[0]:
-                if st.button("📊 Exportar a CSV", use_container_width=True):
+                if st.button("📊 Exportar a CSV", width="stretch"):
                     csv = merged_df.to_csv().encode('utf-8')
                     st.download_button(
                         label="Descargar CSV",
@@ -1123,10 +1123,10 @@ with tab1:
                         file_name="movimientos_encendido_apagado.csv",
                         mime="text/csv",
                         key="download_csv_btn",
-                        use_container_width=True
+                        width="stretch"
                     )
             with export_cols[1]:
-                if st.button("📈 Ver estadísticas", use_container_width=True):
+                if st.button("📈 Ver estadísticas", width="stretch"):
                     with st.expander("Estadísticas", expanded=True):
                         st.write("Estadísticas básicas:")
                         st.write(merged_df.describe())
@@ -1134,7 +1134,7 @@ with tab1:
             # Show the dataframe with better column configuration
             st.dataframe(
                 merged_df.sort_values('fecha', ascending=False) if 'fecha' in merged_df.columns else merged_df, 
-                use_container_width=True, 
+                width="stretch", 
                 height=300,
                 column_config={
                     "central": "Central",
@@ -1175,18 +1175,18 @@ with tab1:
             logging.error(f"Error creating session for status charts: {e}")
     
     # Create and display the pie charts
-    merged_df.head()
+    # Guard: merged_df may be empty/column-less if DB query failed or returned nothing.
+    has_central_col = isinstance(merged_df, pd.DataFrame) and ('central' in merged_df.columns)
+    la_df = merged_df[merged_df['central'] == 'Los Angeles'] if has_central_col else pd.DataFrame()
+    q_df = merged_df[merged_df['central'] == 'Quillota'] if has_central_col else pd.DataFrame()
+
     with pie_cols[0]:
-        # Pass the dataframe with Los Angeles data
-        la_df = merged_df[merged_df['central'] == 'Los Angeles']
         la_chart = create_status_piechart(la_df, 'Los Angeles', st.session_state['time_range'])
-        st.plotly_chart(la_chart, use_container_width=True)
-        
+        st.plotly_chart(la_chart, width="stretch")
+
     with pie_cols[1]:
-        # Pass the dataframe with Quillota data
-        q_df = merged_df[merged_df['central'] == 'Quillota']
         q_chart = create_status_piechart(q_df, 'Quillota', st.session_state['time_range'])
-        st.plotly_chart(q_chart, use_container_width=True)
+        st.plotly_chart(q_chart, width="stretch")
     
     # Add explanatory text
     st.caption(f"Los gráficos muestran la distribución del tiempo en ENCENDIDO/APAGADO durante las últimas {st.session_state['time_range']} horas.")
@@ -1336,7 +1336,7 @@ with tab2:
             # Display the table with better styling
             st.dataframe(
                 filtered_df_mod, 
-                use_container_width=True,
+                width="stretch",
                 height=400,
                 column_config={
                     "nombre": "Central",
@@ -1425,7 +1425,7 @@ with tab3:
                 st.session_state['cmg_tiempo_real_descarga'] = pd.DataFrame()
 
             # Run the expensive queries only when requested
-            fetch_data = st.button("Consultar datos", type="primary", use_container_width=True)
+            fetch_data = st.button("Consultar datos", type="primary", width="stretch")
 
             if fetch_data:
                 Session = establecer_session(engine)
@@ -1470,7 +1470,7 @@ with tab3:
                 st.markdown(f"<p>Vista previa ({len(filtered_data)} registros):</p>", unsafe_allow_html=True)
                 st.dataframe(
                     filtered_data.head(5),
-                    use_container_width=True,
+                    width="stretch",
                     height=150
                 )
             else:

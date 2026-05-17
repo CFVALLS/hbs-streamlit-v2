@@ -3,13 +3,14 @@ Módulo para establecer la conexión a la base de datos.
 """
 import os
 import sys
+from contextlib import contextmanager
 # Add the project root to the Python path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 from sqlalchemy import create_engine
+from sqlalchemy.engine.url import make_url
 from sqlalchemy.orm import sessionmaker, Session
 import logging
-from contextlib import contextmanager
 from scripts.utils.utils import setup_logging, get_date
 
 # Configurar logger
@@ -35,11 +36,37 @@ def establecer_engine(database_url=None):
             
             # If not set, try to construct from individual environment variables
             if database_url is None:
-                db_user = os.getenv("DB_USER", "admin")
-                db_password = os.getenv("DB_USER_PASSWORD", "")
-                db_host = os.getenv("DB_HOST", "172.27.144.1")
-                db_port = os.getenv("DB_PORT", "3306")
-                db_name = os.getenv("DB_DATABASE", "hbsv2")
+                # Prefer explicit DB_* vars, then MYSQL_*, then AWS_MYSQL_*.
+                db_user = (
+                    os.getenv("DB_USER")
+                    or os.getenv("MYSQL_USER")
+                    or os.getenv("AWS_MYSQL_USER")
+                    or "admin"
+                )
+                db_password = (
+                    os.getenv("DB_USER_PASSWORD")
+                    or os.getenv("MYSQL_USER_PASSWORD")
+                    or os.getenv("AWS_MYSQL_USER_PASSWORD")
+                    or ""
+                )
+                db_host = (
+                    os.getenv("DB_HOST")
+                    or os.getenv("MYSQL_HOST")
+                    or os.getenv("AWS_MYSQL_HOST")
+                    or "172.27.144.1"
+                )
+                db_port = (
+                    os.getenv("DB_PORT")
+                    or os.getenv("MYSQL_PORT")
+                    or os.getenv("AWS_MYSQL_PORT")
+                    or "3306"
+                )
+                db_name = (
+                    os.getenv("DB_DATABASE")
+                    or os.getenv("MYSQL_DATABASE")
+                    or os.getenv("AWS_MYSQL_DATABASE")
+                    or "hbsv2"
+                )
                 
                 # Construct MySQL connection string
                 database_url = f"mysql+pymysql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
@@ -51,7 +78,15 @@ def establecer_engine(database_url=None):
         
         # Crear engine
         engine = create_engine(database_url)
-        logger.info(f"Engine establecido con éxito: {database_url}")
+        try:
+            parsed_url = make_url(database_url)
+            safe_target = (
+                f"{parsed_url.drivername}://{parsed_url.host}:{parsed_url.port}/"
+                f"{parsed_url.database}"
+            )
+        except Exception:
+            safe_target = "<unparsed_db_target>"
+        logger.info(f"Engine establecido con éxito: {safe_target}")
         return engine
     
     except Exception as e:

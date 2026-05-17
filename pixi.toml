@@ -1,0 +1,37 @@
+[workspace]
+name = "hbs-streamlit-v2"
+version = "0.1.0"
+description = "Pixi environment for the HBS Streamlit app"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[tasks]
+app = "streamlit run app.py"
+smoke = "python -m py_compile app.py db/*.py scripts/utils/*.py utils/*.py"
+
+[dependencies]
+python = "3.11.*"
+pip = ">=24"
+
+[pypi-dependencies]
+streamlit = ">=1.21.0"
+pandas = ">=1.3.0"
+numpy = ">=1.20.0"
+plotly = ">=5.6.0"
+pytz = ">=2022.1"
+sqlalchemy = ">=1.4.0"
+pymysql = ">=1.0.2"
+mysql-connector-python = ">=8.0.0"
+requests = ">=2.27.1"
+python-dotenv = ">=0.20.0"
+pytest = ">=7.0.0"
+pytest-cov = ">=3.0.0"
+pre-commit = ">=2.20.0"
+black = ">=22.3.0"
+flake8 = ">=4.0.0"
+mypy = ">=0.971"
+cryptography = ">=37.0.0"
+typing-extensions = ">=4.0.0"
+toml = ">=0.10.2"
+fastapi = ">=0.110.0"
+uvicorn = ">=0.23.0"
