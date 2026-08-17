@@ -11,10 +11,6 @@ import pandas as pd
 from dotenv import load_dotenv
 from datetime import timedelta, datetime
 
-# mysql
-import mysql.connector
-from mysql.connector import Error
-
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy import Table, select, MetaData, desc, asc

@@ -15,6 +15,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import logging
 import pytz
+import unicodedata
 from urllib.parse import quote
 
 # Configure logging
@@ -199,7 +200,19 @@ def is_mobile():
     # on window size.
     return False  # Default assumption - can be refined in future versions
 
-def get_json_costo_marginal_online(fecha_gte, fecha_lte, barras, user_key=None, verbose=False):
+def _normalize_bar_label(value):
+    normalized = unicodedata.normalize('NFKD', str(value))
+    return ''.join(char for char in normalized if not unicodedata.combining(char)).casefold()
+
+
+def get_json_costo_marginal_online(
+    fecha_gte,
+    fecha_lte,
+    barras,
+    user_key=None,
+    verbose=False,
+    api_url=None,
+):
     """
     Fetch data from Coordinador API or returns empty list if fails.
     
@@ -214,7 +227,10 @@ def get_json_costo_marginal_online(fecha_gte, fecha_lte, barras, user_key=None, 
         list: Filtered data for the specified bars
     """
     # Build URL and headers
-    url = "https://api.coordinador.cl/v2/costos-marginales/reales"
+    url = api_url or os.getenv(
+        "COORDINADOR_API_URL",
+        "https://api.coordinador.cl/v2/costos-marginales/reales",
+    )
     headers = {
         "Content-Type": "application/json",
         "User-Api-Key": user_key if user_key else ""
@@ -251,13 +267,18 @@ def get_json_costo_marginal_online(fecha_gte, fecha_lte, barras, user_key=None, 
             logging.error(f"Failed to decode JSON: {e}. Response: {response.text[:100]}...")
             return []
             
-        # Check if JSON data is empty
-        if not json_data:
+        if isinstance(json_data, dict):
+            json_data = json_data.get("data") or json_data.get("items") or json_data.get("results") or []
+        if not isinstance(json_data, list) or not json_data:
             logging.warning("API returned empty JSON data")
             return []
-            
-        # Filter data by barras
-        filtered_data = [n for n in json_data if n['barra'] in barras]
+
+        requested_bars = {_normalize_bar_label(barra) for barra in barras}
+        filtered_data = [
+            row for row in json_data
+            if isinstance(row, dict)
+            and _normalize_bar_label(row.get('barra', '')) in requested_bars
+        ]
         return filtered_data
         
     except requests.exceptions.RequestException as error:
@@ -268,7 +289,14 @@ def get_json_costo_marginal_online(fecha_gte, fecha_lte, barras, user_key=None, 
         return []
 
 # Function to get costo marginal online hora
-def get_costo_marginal_online_hora(fecha_gte, fecha_lte, barras, hora_in, user_key=None):
+def get_costo_marginal_online_hora(
+    fecha_gte,
+    fecha_lte,
+    barras,
+    hora_in,
+    user_key=None,
+    api_url=None,
+):
     """
     Obtiene los valores del costo marginal de las barras en una hora específica.
 
@@ -283,16 +311,35 @@ def get_costo_marginal_online_hora(fecha_gte, fecha_lte, barras, hora_in, user_k
         dict: Diccionario con las barras como llaves y los valores de costo marginal como valores.
     """
     json_raw = get_json_costo_marginal_online(
-        fecha_gte, fecha_lte, barras, user_key)
+        fecha_gte, fecha_lte, barras, user_key, api_url=api_url)
     if not json_raw:
         logging.warning("get_costo_marginal_online_hora: No data returned from API")
         return {}
     
     try:
-        fecha_cutoff = datetime.strptime(f'{fecha_lte} {hora_in}', '%Y-%m-%d %H:%M:%S')
-        selected_data = [row for row in json_raw if datetime.strptime(row['fecha'], '%Y-%m-%d %H:%M:%S') == fecha_cutoff]
-        out_dict = {row['barra']: row['cmg'] for row in selected_data}
-        return out_dict
+        fecha_cutoff = pd.Timestamp(f'{fecha_lte} {hora_in}').floor('h')
+        selected = {}
+        for row in json_raw:
+            row_date = pd.to_datetime(row.get('fecha'), errors='coerce')
+            if not pd.isna(row_date) and row_date.tzinfo is not None:
+                row_date = row_date.tz_convert('America/Santiago').tz_localize(None)
+            if pd.isna(row_date) or row_date.floor('h') != fecha_cutoff:
+                continue
+
+            normalized_bar = _normalize_bar_label(row.get('barra', ''))
+            if normalized_bar == 'charrua':
+                bar = 'Charrua'
+            elif normalized_bar == 'quillota':
+                bar = 'Quillota'
+            else:
+                continue
+            try:
+                cmg_value = float(row['cmg'])
+                if bar not in selected or row_date > selected[bar][0]:
+                    selected[bar] = (row_date, cmg_value)
+            except (KeyError, TypeError, ValueError):
+                logging.warning(f"Invalid CMg value for {bar}: {row.get('cmg')}")
+        return {bar: value for bar, (_, value) in selected.items()}
     except Exception as e:
         logging.error(f"Error processing data in get_costo_marginal_online_hora: {e}")
         return {}
@@ -376,19 +423,11 @@ def get_cmg_programados(name_central, date_in, host=None, port=None, session=Non
             result = db_get_cmg_programados(session, name_central, date_in)
             return result
         except Exception as e:
-            # Log the error
             logging.error(f"Error retrieving CMG programados from database: {e}")
-            # Continue to use other methods
-    
-    # In local development mode or if database access failed, return mock data
-    if host == "localhost" or not host or not port:
-        # Create mock hourly data
-        result = {}
-        for hour in range(24):
-            hour_key = f"{hour:02d}:00"
-            result[hour_key] = 50.0 + hour  # Simple increasing values
-        
-        return result
+            raise
+
+    if not host or not port:
+        return {}
     
     # Normal API behavior when not in local development and not using direct DB access
     url = f"http://{host}:{port}/cmg_programados/{name_central}/{date_in}"
@@ -402,10 +441,13 @@ def get_cmg_programados(name_central, date_in, host=None, port=None, session=Non
         else:
             return {"error": "Failed to retrieve central entry"}
     except Exception as e:
-        return {"00:00": 50.0, "01:00": 51.0, "02:00": 52.0}  # Fallback mock data
+        logging.error(f"Error retrieving CMG programados from API: {e}")
+        return {}
 
 # Function to insert central
 def insert_central(name_central, editor, data, host=None, port=None):
+    if not host or not port:
+        raise ValueError("El servicio de actualización no está configurado")
     url = f"http://{host}:{port}/central/insert/{quote(name_central)}/{quote(editor)}"
     headers = {"Content-Type": "application/json"}
     
@@ -414,14 +456,12 @@ def insert_central(name_central, editor, data, host=None, port=None):
         
         if response.status_code == 200:
             return response.json()
-        elif response.status_code == 404:
-            return {"error": "No central entries found"}
-        else:
-            return (f"Failed to insert central entry. Response content: {response.content}")
+        raise RuntimeError(
+            f"El servicio de actualización respondió {response.status_code}: {response.text}"
+        )
             
     except requests.RequestException as e:
-        st.write(f"Request failed: {e}")
-        return {"error": f"Request failed: {e}"}
+        raise RuntimeError(f"No fue posible contactar el servicio de actualización: {e}") from e
 
 # Function to reformat to iso
 def reformat_to_iso(date_string):
@@ -443,29 +483,35 @@ def create_status_piechart(merged_df, central_name, time_range=None):
     Returns:
         plotly figure object with pie chart
     """
-    if merged_df.empty:
+    required_columns = {"unix_time", "status_operacional"}
+    if merged_df.empty or not required_columns.issubset(merged_df.columns):
         # Return empty chart if no data
         fig = go.Figure()
         fig.update_layout(title=f"No status data available for {central_name}")
         return fig
     
-    # Ensure data is sorted by time
-    df = merged_df.sort_values('unix_time')
-    
-    # Calculate time durations
-    df['next_time'] = df['unix_time'].shift(-1)
-    
-    # Handle the last row - assume same duration as previous or use a small value
-    if len(df) > 1:
-        # Use same duration as previous row for last entry
-        last_duration = df.iloc[-2]['next_time'] - df.iloc[-2]['unix_time']
-        df.loc[df.index[-1], 'next_time'] = df.iloc[-1]['unix_time'] + last_duration
-    
-    # Calculate duration in seconds for each state
+    df = merged_df.copy()
+    df['unix_time'] = pd.to_numeric(df['unix_time'], errors='coerce')
+    df = df.dropna(subset=['unix_time', 'status_operacional']).sort_values('unix_time')
+    if df.empty:
+        fig = go.Figure()
+        fig.update_layout(title=f"No status data available for {central_name}")
+        return fig
+
+    now = int(time.time())
+    if time_range:
+        cutoff = now - int(time_range) * 3600
+        previous = df[df['unix_time'] < cutoff].tail(1)
+        df = pd.concat([previous, df[df['unix_time'] >= cutoff]]).drop_duplicates()
+        df['unix_time'] = df['unix_time'].clip(lower=cutoff)
+
+    df['next_time'] = df['unix_time'].shift(-1).fillna(now)
     df['duration'] = df['next_time'] - df['unix_time']
-    
-    # Filter out any negative durations (which would be errors)
-    df = df[df['duration'] >= 0]
+    df = df[df['duration'] > 0]
+    if df.empty:
+        fig = go.Figure()
+        fig.update_layout(title=f"No status data available for {central_name}")
+        return fig
     
     # Group by state and sum durations
     status_summary = df.groupby('status_operacional')['duration'].sum().reset_index()

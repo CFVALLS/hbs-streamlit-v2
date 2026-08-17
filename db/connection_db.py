@@ -7,7 +7,8 @@ from contextlib import contextmanager
 # Add the project root to the Python path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.engine.url import make_url
 from sqlalchemy.orm import sessionmaker, Session
 import logging
@@ -76,10 +77,25 @@ def establecer_engine(database_url=None):
                     database_url = "sqlite:///cmg_db.sqlite"
                     logger.warning("Using SQLite as fallback database")
         
-        # Crear engine
-        engine = create_engine(database_url)
+        parsed_url = make_url(database_url)
+        engine_options = {"pool_pre_ping": True}
+        if parsed_url.get_backend_name() == "mysql":
+            if parsed_url.drivername != "mysql+pymysql":
+                raise ValueError(
+                    f"Driver MySQL no soportado: {parsed_url.drivername}. Use mysql+pymysql."
+                )
+            engine_options.update({
+                "pool_recycle": 300,
+                "pool_timeout": 10,
+                "connect_args": {
+                    "connect_timeout": 10,
+                    "read_timeout": 30,
+                    "write_timeout": 30,
+                },
+            })
+
+        engine = create_engine(database_url, **engine_options)
         try:
-            parsed_url = make_url(database_url)
             safe_target = (
                 f"{parsed_url.drivername}://{parsed_url.host}:{parsed_url.port}/"
                 f"{parsed_url.database}"
@@ -93,6 +109,20 @@ def establecer_engine(database_url=None):
         logger.error(f"Error al establecer engine: {e}")
         raise
 
+
+def verificar_conexion(engine) -> bool:
+    """Verify that the engine can execute a query against its database."""
+    if engine is None:
+        return False
+
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+        return True
+    except SQLAlchemyError as error:
+        logger.error(f"La verificación de conexión falló: {error}")
+        return False
+
 def establecer_session(engine):
     """
     Establece y retorna una sesión de SQLAlchemy.
@@ -104,6 +134,9 @@ def establecer_session(engine):
         Session: Sesión de SQLAlchemy
     """
     try:
+        if engine is None:
+            raise ValueError("No se puede crear una sesión sin engine")
+
         # Crear sessionmaker
         SessionMaker = sessionmaker(bind=engine)
         
@@ -126,7 +159,10 @@ def session_scope(session: Session):
         yield session
         session.commit()
     except Exception:
-        session.rollback()
+        try:
+            session.rollback()
+        except Exception as rollback_error:
+            logger.error(f"Error al revertir la sesión: {rollback_error}")
         raise
     finally:
         session.close()

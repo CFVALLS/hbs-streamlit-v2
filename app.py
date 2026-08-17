@@ -9,6 +9,7 @@ import calendar
 import json
 import base64
 import io
+import math
 import requests
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -16,7 +17,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import logging
 import pytz
-from urllib.parse import quote
+from sqlalchemy.engine import URL
 
 # Configure logging
 # Configure root logger to not impact Streamlit's UI
@@ -66,12 +67,22 @@ from db.operaciones_db import (
     get_latest_desacople_event
 )
 
-from db.connection_db import establecer_engine, establecer_session, session_scope
+from db.connection_db import (
+    establecer_engine,
+    establecer_session,
+    session_scope,
+    verificar_conexion,
+)
+from utils.data_processing import (
+    filter_by_bar,
+    normalize_cmg_dataframe,
+    prepare_download_dataframe,
+    stale_cmg_for_range,
+)
 from utils.helpers import (
     tooltip,
     add_notification,
     show_notifications,
-    auto_refresh,
     is_mobile,
     get_json_costo_marginal_online,
     get_costo_marginal_online_hora,
@@ -268,6 +279,71 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+TIME_RANGE_OPTIONS = {"12h": 12, "24h": 24, "48h": 48, "72h": 72, "7d": 168}
+CHART_TYPE_OPTIONS = {"Línea": "line", "Área": "area", "Barra": "bar"}
+
+
+def reset_refresh_timer():
+    st.session_state["last_refresh_time"] = time.time()
+
+
+with st.sidebar:
+    st.title("Configuración")
+    st.toggle("Modo oscuro", key="dark_mode")
+    st.selectbox("Idioma", ["Español", "English"], index=0, disabled=True)
+    st.markdown("---")
+    st.markdown("### Visualización")
+    st.toggle(
+        "Actualización automática",
+        key="auto_refresh",
+        on_change=reset_refresh_timer,
+    )
+    if st.session_state["auto_refresh"]:
+        st.select_slider(
+            "Intervalo (minutos)",
+            options=[1, 2, 5, 10, 15, 30, 60],
+            key="refresh_interval",
+            on_change=reset_refresh_timer,
+        )
+
+    selected_range = st.radio(
+        "Rango de tiempo",
+        options=list(TIME_RANGE_OPTIONS),
+        horizontal=True,
+        index=list(TIME_RANGE_OPTIONS.values()).index(st.session_state["time_range"]),
+    )
+    st.session_state["time_range"] = TIME_RANGE_OPTIONS[selected_range]
+
+    selected_chart = st.radio(
+        "Tipo de gráfico",
+        options=list(CHART_TYPE_OPTIONS),
+        horizontal=True,
+        index=list(CHART_TYPE_OPTIONS.values()).index(st.session_state["chart_type"]),
+    )
+    st.session_state["chart_type"] = CHART_TYPE_OPTIONS[selected_chart]
+    st.checkbox("Charrúa (Los Angeles)", key="show_charrua")
+    st.checkbox("Quillota", key="show_quillota")
+    st.checkbox("Costos Operacionales", key="show_operational_costs")
+
+
+@st.fragment(run_every=timedelta(seconds=10) if st.session_state["auto_refresh"] else None)
+def schedule_auto_refresh():
+    if not st.session_state["auto_refresh"]:
+        return
+
+    now = time.time()
+    refresh_seconds = st.session_state["refresh_interval"] * 60
+    last_refresh = st.session_state.setdefault("last_refresh_time", now)
+    remaining = max(0, int(last_refresh + refresh_seconds - now))
+    with st.sidebar:
+        st.caption(f"Próxima actualización en {remaining // 60}m {remaining % 60}s")
+    if remaining == 0:
+        st.session_state["last_refresh_time"] = now
+        st.rerun()
+
+
+schedule_auto_refresh()
+
 # Get date in format YYYY-MM-DD and current hour
 # Specify the timezone for Chile
 chile_tz = pytz.timezone('America/Santiago')
@@ -283,8 +359,7 @@ hora = hora.split(':')
 hora_redondeada = f'{hora[0]}:00:00'
 hora_redondeada_cmg_programados = f'{hora[0]}:00'
 
-naive_datetime = chile_datetime.astimezone().replace(tzinfo=None)
-unixtime = int(time.mktime(naive_datetime.timetuple()))
+unixtime = int(chile_datetime.timestamp() // 60 * 60)
 
 # Safe access to secrets (avoid crash when secrets.toml is missing)
 def get_secret_section(section_name: str) -> dict:
@@ -317,24 +392,28 @@ def load_local_secrets():
 
 # Credenciales mysql remoto con fallback local para desarrollo
 def load_db_config():
-    # Prefer Streamlit secrets if available
     secrets = get_secret_section("AWS_MYSQL")
-    if secrets:
-        return {
-            "DATABASE": secrets.get("DATABASE"),
-            "HOST": secrets.get("HOST"),
-            "USER": secrets.get("USER"),
-            "PASSWORD": secrets.get("USER_PASSWORD", ""),
-            "PORT": secrets.get("PORT", "3306"),
-        }
-    
-    # Fallback: environment variables or local Laragon defaults
+
+    def first_value(secret_key, *environment_keys, default=None):
+        if secrets.get(secret_key) not in (None, ""):
+            return secrets[secret_key]
+        return next(
+            (os.getenv(key) for key in environment_keys if os.getenv(key) not in (None, "")),
+            default,
+        )
+
     return {
-        "DATABASE": os.getenv("DB_DATABASE", "hbsv2"),
-        "HOST": os.getenv("DB_HOST", "172.27.144.1"),
-        "USER": os.getenv("DB_USER", "admin"),
-        "PASSWORD": os.getenv("DB_USER_PASSWORD", ""),
-        "PORT": os.getenv("DB_PORT", "3306"),
+        "DATABASE": first_value("DATABASE", "DB_DATABASE", "MYSQL_DATABASE", "AWS_MYSQL_DATABASE"),
+        "HOST": first_value("HOST", "DB_HOST", "MYSQL_HOST", "AWS_MYSQL_HOST"),
+        "USER": first_value("USER", "DB_USER", "MYSQL_USER", "AWS_MYSQL_USER"),
+        "PASSWORD": first_value(
+            "USER_PASSWORD",
+            "DB_USER_PASSWORD",
+            "MYSQL_USER_PASSWORD",
+            "AWS_MYSQL_USER_PASSWORD",
+            default="",
+        ),
+        "PORT": first_value("PORT", "DB_PORT", "MYSQL_PORT", "AWS_MYSQL_PORT", default="3306"),
     }
 
 db_conf = load_db_config()
@@ -346,200 +425,229 @@ PORT = db_conf["PORT"]
 
 # API key (still optional)
 USER_KEY = get_secret_section("COORDINADOR").get("USER_KEY", os.getenv("COORDINADOR_USER_KEY", ""))
+COORDINADOR_API_URL = get_secret_section("COORDINADOR").get(
+    "API_URL",
+    os.getenv(
+        "COORDINADOR_API_URL",
+        "https://api.coordinador.cl/v2/costos-marginales/reales",
+    ),
+)
 
 #Informacion API flask (optional; fallback to env/default localhost)
 API_HOST = get_secret_section("API").get("HOST", os.getenv("API_HOST", "localhost"))
 API_PORT = get_secret_section("API").get("PORT", os.getenv("API_PORT", "8000"))
 
 
-# Establecer motor de base de datos (cacheado para evitar recrearlo en cada rerun)
+def build_database_url():
+    configured_url = os.getenv("DB_CONNECTION_STRING")
+    if configured_url:
+        return configured_url
+    if not all([DATABASE, HOST, USER]):
+        raise ValueError("La configuración de base de datos está incompleta")
+    return URL.create(
+        "mysql+pymysql",
+        username=USER,
+        password=PASSWORD,
+        host=HOST,
+        port=int(PORT),
+        database=DATABASE,
+    )
+
+
 @st.cache_resource(show_spinner=False)
-def get_engine():
-    db_url = f"mysql+pymysql://{USER}:{PASSWORD}@{HOST}:{PORT}/{DATABASE}"
-    # establecer_engine de este proyecto acepta un string de conexión; construimos aquí para compatibilidad
+def get_engine(db_url):
     return establecer_engine(db_url)
 
-engine = get_engine()
-session = establecer_session(engine)
-
-
-CONN_STATUS = engine is not None
+try:
+    database_url = build_database_url()
+    engine = get_engine(database_url)
+    CONN_STATUS = verificar_conexion(engine)
+except Exception as connection_error:
+    logger.error(f"No fue posible inicializar la base de datos: {connection_error}")
+    engine = None
+    CONN_STATUS = False
 
 # Initialize dataframes that will be populated by database queries
 # These will remain empty if the database connection fails
 df_central = pd.DataFrame()
 df_central_mod = pd.DataFrame()
 df_central_mod_co = pd.DataFrame()
-cmg_ponderado_96h = pd.DataFrame()
+cmg_ponderado_96h = normalize_cmg_dataframe(pd.DataFrame())
 merged_df = pd.DataFrame()
 filtered_df = pd.DataFrame()  # Initialize filtered_df with empty DataFrame
 
-# Initialize variables with default values in case DB connection fails
-ultimo_tracking = "N/A"
-ultimo_mod_rio = "N/A"
-central_referencia_charrua = "No Activo"
-afecto_desacople_charrua = "No Activo"
-cmg_charrua = 0.0
-central_referencia_quillota = "No Activo"
-afecto_desacople_quillota = "No Activo"
-cmg_quillota = 0.0
-estado_generacion_la = False
-estado_generacion_q = False
-costo_operacional_la = 0.0
-costo_operacional_la_base = 0.0
-costo_operacional_q = 0.0
-costo_operacional_q_base = 0.0
-row_cmg_la = 0.0
-row_cmg_quillota = 0.0
+# Initialize truthful empty states; unavailable data must not look like a real zero.
+ultimo_tracking = "N/D"
+ultimo_mod_rio = "N/D"
+central_referencia_charrua = "N/D"
+afecto_desacople_charrua = "N/D"
+cmg_charrua = None
+central_referencia_quillota = "N/D"
+afecto_desacople_quillota = "N/D"
+cmg_quillota = None
+estado_generacion_la = None
+estado_generacion_q = None
+costo_operacional_la = None
+costo_operacional_la_base = None
+costo_operacional_q = None
+costo_operacional_q_base = None
+row_cmg_la = None
+row_cmg_quillota = None
+desacople_event_charrua = {}
+desacople_event_quillota = {}
+db_query_errors = []
+data_is_stale = False
 
 # Cacheable fetchers to reduce repeated DB reads on reruns
 @st.cache_data(show_spinner=False, ttl=60)
 def get_cmg_ponderado_cached(unixtime_in: int, time_range_hours: int):
     """Fetch cmg ponderado data for a time window; cached for 60s to avoid re-querying every rerun."""
-    local_engine = get_engine()
+    local_engine = get_engine(database_url)
     SessionLocal = establecer_session(local_engine)
     with session_scope(SessionLocal) as session:
         df = pd.DataFrame(query_cmg_ponderado_by_time(session, unixtime_in, time_range_hours))
-    return df.copy()
+    return normalize_cmg_dataframe(df)
 
 @st.cache_data(show_spinner=False, ttl=60)
 def get_cmg_programados_cached(name_central: str, date_in: str, conn_status: bool, api_host: str, api_port: str):
     """Cache CMg programados per central/date for 60s to avoid repeated calls."""
     if conn_status:
-        SessionLocal = establecer_session(get_engine())
+        SessionLocal = establecer_session(get_engine(database_url))
         with session_scope(SessionLocal) as session:
             result = get_cmg_programados(name_central, date_in=date_in, session=session)
     else:
-        result = get_cmg_programados(name_central, date_in=date_in, host=api_host, port=api_port)
+        result = {}
     return result.copy() if isinstance(result, dict) else result
+
+
+@st.cache_data(show_spinner=False, ttl=300)
+def get_cmg_online_cached(date_in: str, hour_in: str, user_key: str, api_url: str):
+    return get_costo_marginal_online_hora(
+        fecha_gte=date_in,
+        fecha_lte=date_in,
+        barras=['Quillota', 'Charrua'],
+        hora_in=hour_in,
+        user_key=user_key,
+        api_url=api_url,
+    )
 
 #############################################################
 ###################  Consultas    ###########################
 #############################################################
 
-if engine is not None:
+if CONN_STATUS:
     Session = establecer_session(engine)
     if Session is not None:
         try:
             with session_scope(Session) as session:
+                def safe_query(label, query, default):
+                    try:
+                        return query()
+                    except Exception as query_error:
+                        logger.error(f"Error consultando {label}: {query_error}")
+                        db_query_errors.append(label)
+                        try:
+                            session.rollback()
+                        except Exception as rollback_error:
+                            logger.error(f"No fue posible revertir {label}: {rollback_error}")
+                        return default
+
                 # Latest desacople events per barra
-                desacople_event_charrua = get_latest_desacople_event(session, 'CHARRUA__220') or {}
-                desacople_event_quillota = get_latest_desacople_event(session, 'QUILLOTA__220') or {}
+                desacople_event_charrua = safe_query(
+                    "desacople Charrúa",
+                    lambda: get_latest_desacople_event(session, 'CHARRUA__220') or {},
+                    {},
+                )
+                desacople_event_quillota = safe_query(
+                    "desacople Quillota",
+                    lambda: get_latest_desacople_event(session, 'QUILLOTA__220') or {},
+                    {},
+                )
                 # last row tracking_cmg
-                tracking_cmg_last_row = retrieve_tracking_coordinador(session)
-                ultimo_tracking = tracking_cmg_last_row[1]
-                ultimo_mod_rio = tracking_cmg_last_row[3]
+                tracking_cmg_last_row = safe_query(
+                    "tracking CMg",
+                    lambda: retrieve_tracking_coordinador(session),
+                    [None, None, None, None],
+                )
+                ultimo_tracking = tracking_cmg_last_row[1] or "N/D"
+                ultimo_mod_rio = tracking_cmg_last_row[2] or "N/D"
 
                 # get last entry cmg_tiempo_real , afecto_desacople, central_referencia
-                central_referencia_charrua, desacople_charrua, cmg_charrua = query_values_last_desacople_bool(
-                    session, barra_transmision='CHARRUA__220')
+                central_referencia_charrua, desacople_charrua, cmg_charrua = safe_query(
+                    "CMg tiempo real Charrúa",
+                    lambda: query_values_last_desacople_bool(
+                        session, barra_transmision='CHARRUA__220'
+                    ),
+                    (None, None, None),
+                )
 
-                if desacople_charrua:
+                if desacople_charrua is True:
                     afecto_desacople_charrua = 'Activo'
-                else:
+                elif desacople_charrua is False:
                     afecto_desacople_charrua = 'No Activo'
+                central_referencia_charrua = central_referencia_charrua or "N/D"
 
-                central_referencia_quillota, desacople_quillota, cmg_quillota = query_values_last_desacople_bool(
-                    session, barra_transmision='QUILLOTA__220')
+                central_referencia_quillota, desacople_quillota, cmg_quillota = safe_query(
+                    "CMg tiempo real Quillota",
+                    lambda: query_values_last_desacople_bool(
+                        session, barra_transmision='QUILLOTA__220'
+                    ),
+                    (None, None, None),
+                )
 
-                if desacople_quillota:
+                if desacople_quillota is True:
                     afecto_desacople_quillota = 'Activo'
-                else:
+                elif desacople_quillota is False:
                     afecto_desacople_quillota = 'No Activo'
+                central_referencia_quillota = central_referencia_quillota or "N/D"
 
-                cmg_charrua = round(float(cmg_charrua), 2)
-                cmg_quillota = round(float(cmg_quillota), 2)
+                cmg_charrua = round(float(cmg_charrua), 2) if cmg_charrua is not None else None
+                cmg_quillota = round(float(cmg_quillota), 2) if cmg_quillota is not None else None
                 
-                # consulta de datos cmg_ponderado 48 horas previas
-                cmg_ponderado_96h = get_cmg_ponderado_cached(unixtime, st.session_state['time_range'])
-                # Try multiple date formats to handle mixed formats
-                if not cmg_ponderado_96h.empty and 'timestamp' in cmg_ponderado_96h.columns:
-                    # Ensure timestamp column is string type
-                    cmg_ponderado_96h['timestamp'] = cmg_ponderado_96h['timestamp'].astype(str)
-                    
-                    # Try to convert with multiple formats in sequence
-                    try:
-                        cmg_ponderado_96h['timestamp'] = pd.to_datetime(cmg_ponderado_96h["timestamp"], format="%d.%m.%y %H:%M:%S", errors='coerce')
-                    except ValueError:
-                        pass
-                        
-                    # Fill NaT values with next format attempt
-                    mask = cmg_ponderado_96h['timestamp'].isna()
-                    if mask.any():
-                        try:
-                            cmg_ponderado_96h.loc[mask, 'timestamp'] = pd.to_datetime(
-                                cmg_ponderado_96h.loc[mask, "timestamp"], 
-                                format="%Y-%m-%d %H:%M:%S", 
-                                errors='coerce'
-                            )
-                        except ValueError:
-                            pass
-                    
-                    # Last attempt with auto-detection for any remaining NaT values
-                    mask = cmg_ponderado_96h['timestamp'].isna()
-                    if mask.any():
-                        try:
-                            cmg_ponderado_96h.loc[mask, 'timestamp'] = pd.to_datetime(
-                                cmg_ponderado_96h.loc[mask, "timestamp"],
-                                errors='coerce'
-                            )
-                        except Exception as e:
-                            st.warning(f"Some timestamp values could not be parsed: {e}")
-                    
-                    # For any remaining NaT values, use current datetime
-                    mask = cmg_ponderado_96h['timestamp'].isna()
-                    if mask.any():
-                        # Convert chile_datetime to pandas datetime64 compatible format first
-                        chile_dt_pandas = pd.to_datetime(chile_datetime.strftime('%Y-%m-%d %H:%M:%S'))
-                        cmg_ponderado_96h.loc[mask, 'timestamp'] = chile_dt_pandas
-                        
-                    # Ensure timestamp is actually datetime type before using .dt accessor
-                    if not pd.api.types.is_datetime64_any_dtype(cmg_ponderado_96h['timestamp']):
-                        try:
-                            # Re-convert to make sure it's actually datetime type
-                            cmg_ponderado_96h['timestamp'] = pd.to_datetime(cmg_ponderado_96h['timestamp'], errors='coerce')
-                        except Exception as e:
-                            st.warning(f"Failed to ensure timestamp is datetime type: {e}")
-                            # Create default timestamp as fallback
-                            cmg_ponderado_96h['timestamp'] = chile_datetime
-                    
-                    # Add fecha and hora columns explicitly with safe checks
-                    try:
-                        cmg_ponderado_96h['fecha'] = cmg_ponderado_96h['timestamp'].dt.strftime('%Y-%m-%d')
-                        cmg_ponderado_96h['hora'] = cmg_ponderado_96h['timestamp'].dt.strftime('%H:%M:%S')
-                    except Exception as e:
-                        st.warning(f"Error using dt accessor: {e}. Using string methods instead.")
-                        # Fallback to string representation if dt accessor fails
-                        cmg_ponderado_96h['fecha'] = chile_datetime.strftime('%Y-%m-%d')
-                        cmg_ponderado_96h['hora'] = chile_datetime.strftime('%H:%M:%S')
+                try:
+                    selected_range_hours = st.session_state['time_range']
+                    cmg_ponderado_96h = get_cmg_ponderado_cached(
+                        unixtime, selected_range_hours
+                    )
+                    if not cmg_ponderado_96h.empty:
+                        cached_ranges = st.session_state.setdefault('last_cmg_by_range', {})
+                        cached_ranges[selected_range_hours] = {
+                            'data': cmg_ponderado_96h.copy(),
+                            'success': chile_datetime,
+                        }
+                except Exception as query_error:
+                    logger.error(f"Error consultando CMg ponderado: {query_error}")
+                    db_query_errors.append("CMg ponderado")
+                    cmg_ponderado_96h, _ = stale_cmg_for_range(
+                        st.session_state.get('last_cmg_by_range', {}),
+                        st.session_state['time_range'],
+                    )
+                    data_is_stale = not cmg_ponderado_96h.empty
                 
-                # Drop unix_time column if it exists
-                if 'unix_time' in cmg_ponderado_96h.columns:
-                    cmg_ponderado_96h.drop(['unix_time'], axis=1, inplace=True)
+                last_row_la = safe_query(
+                    "central Los Angeles",
+                    lambda: query_last_row_central(session, 'Los Angeles'),
+                    None,
+                )
+                last_row_q = safe_query(
+                    "central Quillota",
+                    lambda: query_last_row_central(session, 'Quillota'),
+                    None,
+                )
 
-                # Add central column for mapping to central data
-                if 'barra_transmision' in cmg_ponderado_96h.columns:
-                    cmg_ponderado_96h['central'] = cmg_ponderado_96h['barra_transmision'].replace({
-                        'CHARRUA__220': 'Los Angeles', 
-                        'QUILLOTA__220': 'Quillota',
-                        'charrua__220': 'Los Angeles', 
-                        'quillota__220': 'Quillota',
-                        'CHARRUA_22O': 'Los Angeles',
-                        'QUILLOTA_22O': 'Quillota',
-                        'charrua_22o': 'Los Angeles',
-                        'quillota_22o': 'Quillota'
-                    })
-                
-                # consulta estado central 
-                last_row_la = query_last_row_central(session, 'Los Angeles') 
-                last_row_q = query_last_row_central(session, 'Quillota')
-
-                # Consultar ultimas entradas de table Central: 
-                df_central = query_central_table(session, num_entries=20)
+                df_central = safe_query(
+                    "centrales",
+                    lambda: query_central_table(session, num_entries=20),
+                    pd.DataFrame(),
+                )
                 if not df_central.empty and 'margen_garantia' in df_central.columns:
                     df_central['margen_garantia'] = df_central['margen_garantia'].astype(float)
                 
-                df_central_mod = query_central_table_modifications(session, num_entries=20)
+                df_central_mod = safe_query(
+                    "modificaciones de centrales",
+                    lambda: query_central_table_modifications(session, num_entries=20),
+                    pd.DataFrame(),
+                )
                 if not df_central_mod.empty and 'margen_garantia' in df_central_mod.columns:
                     df_central_mod['margen_garantia'] = df_central_mod['margen_garantia'].astype(float)
 
@@ -610,84 +718,42 @@ if engine is not None:
                     # Create empty DataFrame with same columns
                     filtered_df = pd.DataFrame(columns=df_central_mod_co.columns)
 
-                # Safe access to last_row_la and last_row_q
-                try:
-                    # Get the latest operational status from status_central table
-                    status_la = get_latest_status_central(session, 'Los Angeles')
-                    status_q = get_latest_status_central(session, 'Quillota')
-                    
-                    # Set generation status based on the status_central table values
-                    estado_generacion_la = status_la == 'ON' if status_la else False
-                    estado_generacion_q = status_q == 'ON' if status_q else False
-                    
-                    def safe_float(value):
-                        try:
-                            return float(value)
-                        except (TypeError, ValueError):
-                            return 0.0
+                status_la = safe_query(
+                    "estado Los Angeles",
+                    lambda: get_latest_status_central(session, 'Los Angeles'),
+                    None,
+                )
+                status_q = safe_query(
+                    "estado Quillota",
+                    lambda: get_latest_status_central(session, 'Quillota'),
+                    None,
+                )
+                estado_generacion_la = status_la == 'ON' if status_la else None
+                estado_generacion_q = status_q == 'ON' if status_q else None
 
-                    # Access costo_operacional directly from index 9 where it's stored in the result
-                    costo_operacional_la = round(safe_float(last_row_la[9]), 2) if last_row_la and len(last_row_la) > 9 else 0.0
-                    # Validate that we have factor_motor at index 10
-                    factor_motor_la = round(safe_float(last_row_la[10]), 2) if last_row_la and len(last_row_la) > 10 else 0.0
-                    costo_operacional_la_base = costo_operacional_la - factor_motor_la if costo_operacional_la > 0 else 0.0
-                    
-                    costo_operacional_q = round(safe_float(last_row_q[9]), 2) if last_row_q and len(last_row_q) > 9 else 0.0
-                    factor_motor_q = round(safe_float(last_row_q[10]), 2) if last_row_q and len(last_row_q) > 10 else 0.0
-                    costo_operacional_q_base = costo_operacional_q - factor_motor_q if costo_operacional_q > 0 else 0.0
-                    
-                    # Log the retrieved values
-                    logging.info(f"Retrieved costs - LA: {costo_operacional_la}, Quillota: {costo_operacional_q}")
-                except (IndexError, TypeError, ValueError) as e:
-                    st.warning(f"Error processing central data: {e}")
-                    # Set defaults
-                    estado_generacion_la = False
-                    estado_generacion_q = False
-                    costo_operacional_la = 0.0
-                    costo_operacional_la_base = 0.0
-                    costo_operacional_q = 0.0
-                    costo_operacional_q_base = 0.0
-                
-                # Create the minimal DataFrame we need if cmg_ponderado_96h is empty
-                if cmg_ponderado_96h.empty:
-                    cmg_ponderado = pd.DataFrame({
-                        'timestamp': [chile_datetime.strftime('%Y-%m-%d %H:%M:%S')],
-                        'barra_transmision': ['CHARRUA__220'],
-                        'fecha': [chile_datetime.strftime('%Y-%m-%d')],
-                        'hora': [chile_datetime.strftime('%H:%M:%S')],
-                        'central': ['Los Angeles'],
-                        'cmg_ponderado': [0.0]
-                    })
-                else:
-                    # Use the actual cmg_ponderado_96h data
-                    cmg_ponderado = cmg_ponderado_96h.copy()
-                    
-                    # Normalize the barra_transmision values for consistent filtering
-                    if 'barra_transmision' in cmg_ponderado.columns:
-                        cmg_ponderado['barra_transmision'] = cmg_ponderado['barra_transmision'].str.upper()
-                        # Map different bar name formats to consistent values for filtering
-                        cmg_ponderado['barra_transmision'] = cmg_ponderado['barra_transmision'].replace({
-                            'CHARRUA_22O': 'CHARRUA__220',
-                            'QUILLOTA_22O': 'QUILLOTA__220',
-                            'CHARRUA_220': 'CHARRUA__220',
-                            'QUILLOTA_220': 'QUILLOTA__220',
-                            'CHARRUA': 'CHARRUA__220',
-                            'QUILLOTA': 'QUILLOTA__220'
-                        })
+                def optional_float(value):
+                    try:
+                        return float(value) if value is not None else None
+                    except (TypeError, ValueError):
+                        return None
 
-                # Filter the data for each specific area
-                charrua_filters = ['CHARRUA__220', 'CHARRUA_220', 'CHARRUA_22O', 'CHARRUA', 'charrua_22o']
-                quillota_filters = ['QUILLOTA__220', 'QUILLOTA_220', 'QUILLOTA_22O', 'QUILLOTA', 'quillota_22o']
+                costo_operacional_la = optional_float(last_row_la[9]) if last_row_la and len(last_row_la) > 9 else None
+                factor_motor_la = optional_float(last_row_la[10]) if last_row_la and len(last_row_la) > 10 else None
+                if costo_operacional_la is not None:
+                    costo_operacional_la = round(costo_operacional_la, 2)
+                if costo_operacional_la is not None and factor_motor_la is not None:
+                    costo_operacional_la_base = round(costo_operacional_la - factor_motor_la, 2)
+
+                costo_operacional_q = optional_float(last_row_q[9]) if last_row_q and len(last_row_q) > 9 else None
+                factor_motor_q = optional_float(last_row_q[10]) if last_row_q and len(last_row_q) > 10 else None
+                if costo_operacional_q is not None:
+                    costo_operacional_q = round(costo_operacional_q, 2)
+                if costo_operacional_q is not None and factor_motor_q is not None:
+                    costo_operacional_q_base = round(costo_operacional_q - factor_motor_q, 2)
                 
-                # Filter rows for Los Angeles/Charrua
-                cmg_ponderado_la = cmg_ponderado[
-                    cmg_ponderado['barra_transmision'].str.upper().isin([f.upper() for f in charrua_filters])
-                ]
-                
-                # Filter rows for Quillota
-                cmg_ponderado_quillota = cmg_ponderado[
-                    cmg_ponderado['barra_transmision'].str.upper().isin([f.upper() for f in quillota_filters])
-                ]
+                cmg_ponderado = cmg_ponderado_96h.copy()
+                cmg_ponderado_la = filter_by_bar(cmg_ponderado, 'CHARRUA__220')
+                cmg_ponderado_quillota = filter_by_bar(cmg_ponderado, 'QUILLOTA__220')
                 
                 # Check if dataframes are not empty before accessing elements
                 if not cmg_ponderado_quillota.empty:
@@ -695,53 +761,31 @@ if engine is not None:
                         row_cmg_quillota = round(float(cmg_ponderado_quillota.iloc[-1]['cmg_ponderado']), 2)
                     except (IndexError, ValueError, TypeError) as e:
                         logging.error(f"Error accessing Quillota CMG value: {e}")
-                        row_cmg_quillota = 0.0
+                        row_cmg_quillota = None
                 else:
-                    row_cmg_quillota = 0.0
+                    row_cmg_quillota = None
                     
                 if not cmg_ponderado_la.empty:
                     try:
                         row_cmg_la = round(float(cmg_ponderado_la.iloc[-1]['cmg_ponderado']), 2)
                     except (IndexError, ValueError, TypeError) as e:
                         logging.error(f"Error accessing Los Angeles CMG value: {e}")
-                        row_cmg_la = 0.0
+                        row_cmg_la = None
                 else:
-                    row_cmg_la = 0.0
+                    row_cmg_la = None
 
                 # Get status history from StatusCentral table
                 # This will directly provide the data we need for the "Últimos Movimientos Encendido/Apagado" table
-                try:
-                    if session is not None:
-                        merged_df = get_status_central_history(
-                            session_in=session, 
-                            limit=50, 
-                            centrals=['Los Angeles', 'Quillota']
-                        )
-                    else:
-                        logging.error("Cannot get status history: session is None")
-                        merged_df = pd.DataFrame()
-                except Exception as e:
-                    logging.error(f"Error getting status history: {e}")
-                    merged_df = pd.DataFrame()
-                
-                # If merged_df is empty (no status history yet), create a minimal DataFrame
-                if merged_df.empty:
-                    merged_df = pd.DataFrame({
-                        'central': ['Los Angeles', 'Quillota'],
-                        'timestamp': [chile_datetime.strftime('%Y-%m-%d %H:%M:%S')] * 2,
-                        'fecha': [chile_datetime.strftime('%Y-%m-%d')] * 2,
-                        'hora': [chile_datetime.strftime('%H:%M:%S')] * 2,
-                        'cmg_ponderado': [row_cmg_la, row_cmg_quillota],
-                        'costo_operacional': [costo_operacional_la, costo_operacional_q],
-                        'generando': [estado_generacion_la, estado_generacion_q],
-                        'status_operacional': [
-                            'ON' if estado_generacion_la else 'OFF',
-                            'ON' if estado_generacion_q else 'OFF'
-                        ]
-                    })
-
-                # Data for "Últimos Movimientos Encendido/Apagado" comes directly from StatusCentral table
-                # We've removed the unnecessary code that was overwriting this data with complex merging logic
+                merged_df = safe_query(
+                    "historial de estados",
+                    lambda: get_status_central_history(
+                        session_in=session,
+                        limit=None,
+                        centrals=['Los Angeles', 'Quillota'],
+                        since_unix=unixtime - st.session_state['time_range'] * 3600,
+                    ),
+                    pd.DataFrame(),
+                )
 
         except Exception as e:
             st.error(f"Error accessing database: {str(e)}")
@@ -750,19 +794,28 @@ if engine is not None:
     else:
         st.error("Failed to create database session")
 else:
-    st.error("Database connection failed. Using fallback data.")
+    st.error("No se pudo conectar a la base de datos. No se mostrarán datos simulados.")
 
 ############# Queries externas #############
-# Use direct database access by passing the session parameter
-cmg_programados_quillota = get_cmg_programados_cached('Quillota', fecha, CONN_STATUS, API_HOST, API_PORT)
-cmg_programados_la = get_cmg_programados_cached('Los Angeles', fecha, CONN_STATUS, API_HOST, API_PORT)
-cmg_online = get_costo_marginal_online_hora(fecha_gte=fecha, fecha_lte=fecha, barras=['Quillota', 'Charrua'], hora_in=hora_redondeada, user_key=USER_KEY)
-
-# check if cmg_online is empty
-if not cmg_online:
-    cmg_online = {'Charrua': 'Not Available', 'Quillota': 'Not Available'}
-else:
-    cmg_online = {key : round(cmg_online[key], 2) for key in cmg_online}
+try:
+    cmg_programados_quillota = get_cmg_programados_cached(
+        'Quillota', fecha, CONN_STATUS, API_HOST, API_PORT
+    )
+    cmg_programados_la = get_cmg_programados_cached(
+        'Los Angeles', fecha, CONN_STATUS, API_HOST, API_PORT
+    )
+except Exception as query_error:
+    logger.error(f"Error consultando CMg programados: {query_error}")
+    db_query_errors.append("CMg programados")
+    cmg_programados_quillota = {}
+    cmg_programados_la = {}
+cmg_online = get_cmg_online_cached(
+    fecha, hora_redondeada, USER_KEY, COORDINADOR_API_URL
+)
+cmg_online = {
+    'Charrua': round(cmg_online['Charrua'], 2) if 'Charrua' in cmg_online else None,
+    'Quillota': round(cmg_online['Quillota'], 2) if 'Quillota' in cmg_online else None,
+}
 
 #########################################################
 ################### WEBSITE DESIGN ######################
@@ -773,32 +826,24 @@ with tab1:
     # st.header("Monitoreo")
     # First thing, check connection and show appropriate notification
     if not CONN_STATUS:
-        add_notification("No se pudo conectar a la base de datos. Usando datos de prueba.", type="warning", duration=10)
+        add_notification("No se pudo conectar a la base de datos.", type="warning", duration=10)
+    elif db_query_errors:
+        st.warning(f"No fue posible actualizar: {', '.join(sorted(set(db_query_errors)))}")
+    if data_is_stale:
+        _, last_success = stale_cmg_for_range(
+            st.session_state.get('last_cmg_by_range', {}),
+            st.session_state['time_range'],
+        )
+        last_success = last_success or 'desconocida'
+        st.warning(f"Mostrando el último CMg disponible. Última lectura correcta: {last_success}")
+    if not any(value is not None for value in cmg_online.values()):
+        st.info("El servicio de CMg Online no está disponible en este momento.")
     
     # Check for mobile device and show warning if needed
     if is_mobile() and not st.session_state['mobile_warning_shown']:
         add_notification("Esta aplicación está optimizada para pantallas más grandes. Algunas funcionalidades pueden verse afectadas en dispositivos móviles.", type="info", duration=15)
         st.session_state['mobile_warning_shown'] = True
     
-    # Update data querying to respect the selected time range
-    Session = establecer_session(engine)
-    if Session is not None:
-        try:
-            with session_scope(Session) as session:
-                # Modify this to respect the time range setting
-                cmg_ponderado_96h_update = get_cmg_ponderado_cached(
-                    unixtime,
-                    st.session_state['time_range']  # Use the selected time range instead of fixed 96
-                )
-                
-                # Only update the global variable if we got valid data
-                if not cmg_ponderado_96h_update.empty:
-                    cmg_ponderado_96h = cmg_ponderado_96h_update
-        except Exception as e:
-            st.error(f"Error querying data: {str(e)}")
-    else:
-        st.warning("Could not create database session. Using cached data.")
-
     ################## DATOS Centrales ##############################################
     # Create a unified card template for both locations
     def friendly_delta(dt):
@@ -824,12 +869,15 @@ with tab1:
         st.markdown(f'<h2 class="section-title" style="text-align: center;">{name}</h2>', unsafe_allow_html=True)
 
         # Generation status with icon - make text bold and use stronger colors
-        if estado_generacion:
-            status_color = "#00b300"  # Stronger green
+        if estado_generacion is True:
+            status_color = "#00b300"
             status_text = "ENCENDIDO"
-        else:
-            status_color = "#cc0000"  # Stronger red
+        elif estado_generacion is False:
+            status_color = "#cc0000"
             status_text = "APAGADO"
+        else:
+            status_color = "#6b7280"
+            status_text = "SIN DATOS"
             
         st.markdown(f'<div style="text-align: center; margin-bottom: 1rem;"><span style="color:{status_color}; font-size: 1.5em; font-weight: bold;">● {status_text}</span></div>', unsafe_allow_html=True)
 
@@ -838,6 +886,8 @@ with tab1:
         
         # Define a simple helper for consistent metric cards
         def metric_card(col, label, value, tooltip_key=None):
+            if value is None or (isinstance(value, float) and pd.isna(value)):
+                value = "N/D"
             tooltip_html = f'<div class="metric-label">{tooltip(label, tooltip_key) if tooltip_key else label}</div>'
             col.markdown(f'''
             <div class="metric-card">
@@ -866,9 +916,12 @@ with tab1:
         if afecto_desacople == "Activo":
             status_color = "#ff8c00"  # Stronger orange for active
             status_text = "Activo"
-        else:
+        elif afecto_desacople == "No Activo":
             status_color = "#00b300"  # Stronger green
             status_text = "No Activo"
+        else:
+            status_color = "#6b7280"
+            status_text = "N/D"
             
         cols[1].markdown(f'''
         <div class="metric-card">
@@ -899,7 +952,7 @@ with tab1:
             estado_generacion=estado_generacion_la,
             cmg_calculado=row_cmg_la,
             costo_operacional=costo_operacional_la,
-            cmg_online=cmg_online['Charrua'],
+            cmg_online=cmg_online.get('Charrua'),
             cmg_programado=cmg_programados_la,
             central_referencia=central_referencia_charrua,
             afecto_desacople=afecto_desacople_charrua,
@@ -913,7 +966,7 @@ with tab1:
             estado_generacion=estado_generacion_q,
             cmg_calculado=row_cmg_quillota,
             costo_operacional=costo_operacional_q,
-            cmg_online=cmg_online['Quillota'],
+            cmg_online=cmg_online.get('Quillota'),
             cmg_programado=cmg_programados_quillota,
             central_referencia=central_referencia_quillota,
             afecto_desacople=afecto_desacople_quillota,
@@ -924,18 +977,6 @@ with tab1:
     ################## GRAFICO ##################
     with st.container():
         st.markdown('<h3 class="section-title">Gráfico de CMg Ponderado</h3>', unsafe_allow_html=True)
-
-        costo_operacional_plot_lineas_la = False
-        costo_operacional_plot_lineas_quillota = False
-        if filtered_df.empty:
-            costo_operacional_plot_lineas_quillota = True
-            costo_operacional_plot_lineas_la = True
-        else:
-            cmg_ponderado_96h = pd.concat([cmg_ponderado_96h, filtered_df], axis=1)
-            if filtered_df[filtered_df['nombre'] == 'Quillota'].empty:
-                costo_operacional_plot_lineas_quillota = True
-            if filtered_df[filtered_df['nombre'] == 'Los Angeles'].empty:   
-                costo_operacional_plot_lineas_la = True
 
         # Filter data based on user selection
         plot_data = cmg_ponderado_96h.copy()
@@ -1040,7 +1081,7 @@ with tab1:
             
             # Add horizontal lines for operational costs if enabled
             if st.session_state['show_operational_costs']:
-                if costo_operacional_plot_lineas_quillota and st.session_state['show_quillota']:
+                if costo_operacional_q is not None and st.session_state['show_quillota']:
                     fig.add_hline(
                         y=costo_operacional_q,
                         line_dash="dash",
@@ -1048,7 +1089,7 @@ with tab1:
                         annotation_text="Costo Operacional - Quillota",
                         annotation_position="top right"
                     )
-                if costo_operacional_plot_lineas_la and st.session_state['show_charrua']:
+                if costo_operacional_la is not None and st.session_state['show_charrua']:
                     fig.add_hline(
                         y=costo_operacional_la,
                         line_dash="dash",
@@ -1074,7 +1115,9 @@ with tab1:
 
         with col_data_1:
             st.markdown('<h4 style="font-size: 1.1rem; font-weight: 600;">Costos Marginales Ponderados</h4>', unsafe_allow_html=True)
-            cmg_ponderado_96h['cmg_ponderado'] = cmg_ponderado_96h['cmg_ponderado'].round(2)
+            cmg_ponderado_96h['cmg_ponderado'] = pd.to_numeric(
+                cmg_ponderado_96h['cmg_ponderado'], errors='coerce'
+            ).round(2)
             cmg_ponderado_96h['Central'] = cmg_ponderado_96h['barra_transmision'].replace({'CHARRUA__220':'Los Angeles', 'QUILLOTA__220': 'Quillota'})
             
             # Prepare data with better column names and sorting
@@ -1162,17 +1205,6 @@ with tab1:
     
     # Create two columns for the pie charts
     pie_cols = st.columns(2)
-    
-    # Create session for querying status data
-    status_session = None
-    if CONN_STATUS:
-        try:
-            Session = establecer_session(engine)
-            if Session is not None:
-                with session_scope(Session) as session:
-                    status_session = session
-        except Exception as e:
-            logging.error(f"Error creating session for status charts: {e}")
     
     # Create and display the pie charts
     # Guard: merged_df may be empty/column-less if DB query failed or returned nothing.
@@ -1289,6 +1321,8 @@ with tab2:
                 if submit_button:
                     try:
                         result = insert_central(central_seleccion, editor, dict_data, host=API_HOST, port=API_PORT)
+                        if isinstance(result, dict) and result.get("error"):
+                            raise RuntimeError(result["error"])
                         add_notification(f"Atributos de central {central_seleccion} actualizados correctamente", type="success")
                         st.success(f'Atributos de central {central_seleccion} actualizados correctamente')
                         st.json(result)
@@ -1374,10 +1408,10 @@ with tab3:
             )
             
             if central_seleccion == 'Los Angeles':
-                SELECCIONAR = 'charrua_22o'
+                SELECCIONAR = 'CHARRUA__220'
                 st.markdown('<p style="color: #666; font-size: 0.9rem;">Datos asociados a barra Charrúa</p>', unsafe_allow_html=True)
             else:
-                SELECCIONAR = 'quillota_22o'
+                SELECCIONAR = 'QUILLOTA__220'
                 st.markdown('<p style="color: #666; font-size: 0.9rem;">Datos asociados a barra Quillota</p>', unsafe_allow_html=True)
             
             st.markdown('<p style="margin-top: 1.5rem;"></p>', unsafe_allow_html=True)
@@ -1394,7 +1428,7 @@ with tab3:
             st.markdown('<p style="font-weight: 600;">Seleccionar período para la descarga:</p>', unsafe_allow_html=True)
             date_calculate = st.date_input(
                 "Fecha para descarga de datos",
-                value=datetime(2023, 6, 6).date(),
+                value=(chile_datetime - timedelta(days=7)).date(),
                 min_value=datetime(2023, 5, 1).date(),
                 max_value=datetime.now().date(),
                 label_visibility="collapsed"
@@ -1402,14 +1436,13 @@ with tab3:
             
             # Convert date_calculate to a Unix timestamp
             datetime_obj = datetime.combine(date_calculate, datetime.min.time())
-            # Add timezone info to match chile_datetime
-            datetime_obj = datetime_obj.replace(tzinfo=chile_tz)
+            datetime_obj = chile_tz.localize(datetime_obj)
             unix_timestamp = int(datetime_obj.timestamp())
             
             # Calculate how many hours to query (from selected date to now)
             current_unix = int(chile_datetime.timestamp())
             unix_time_delta = current_unix - unix_timestamp
-            horas_delta = max(1, int(unix_time_delta / 3600))  # Ensure at least 1 hour
+            horas_delta = max(1, math.ceil(unix_time_delta / 3600))
             
             # Show data time range in a more visible way
             days_diff = (chile_datetime.date() - date_calculate).days
@@ -1428,8 +1461,10 @@ with tab3:
             fetch_data = st.button("Consultar datos", type="primary", width="stretch")
 
             if fetch_data:
-                Session = establecer_session(engine)
-                if Session is not None:
+                if days_diff > 90:
+                    st.error("Seleccione un período de 90 días o menos para evitar una consulta excesiva.")
+                elif CONN_STATUS:
+                    Session = establecer_session(engine)
                     try:
                         with session_scope(Session) as session:
                             st.info(f"Consultando datos desde {datetime_obj.strftime('%Y-%m-%d')} hasta hoy")
@@ -1437,11 +1472,15 @@ with tab3:
                             
                             cmg_ponderado_descarga = get_cmg_ponderado_cached(unixtime, horas_delta)
                             
-                            cmg_tiempo_real_data = get_cmg_tiempo_real(session, unix_time_delta)
+                            cmg_tiempo_real_data = get_cmg_tiempo_real(session, unix_timestamp)
                             cmg_tiempo_real_descarga = pd.DataFrame(cmg_tiempo_real_data)
                             
                             st.session_state['cmg_ponderado_descarga'] = cmg_ponderado_descarga
                             st.session_state['cmg_tiempo_real_descarga'] = cmg_tiempo_real_descarga
+                            st.session_state['download_query'] = (
+                                date_calculate.isoformat(),
+                                SELECCIONAR,
+                            )
                             
                             if cmg_ponderado_descarga.empty:
                                 st.warning("No se encontraron datos de CMg Ponderado para la fecha seleccionada")
@@ -1463,13 +1502,27 @@ with tab3:
 
             cmg_ponderado_descarga = st.session_state['cmg_ponderado_descarga']
             cmg_tiempo_real_descarga = st.session_state['cmg_tiempo_real_descarga']
+            current_download_query = (date_calculate.isoformat(), SELECCIONAR)
+            if st.session_state.get('download_query') != current_download_query:
+                cmg_ponderado_descarga = pd.DataFrame()
+                cmg_tiempo_real_descarga = pd.DataFrame()
+
+            ponderado_selected = prepare_download_dataframe(
+                cmg_ponderado_descarga,
+                SELECCIONAR,
+                unix_timestamp,
+            )
+            tiempo_real_selected = prepare_download_dataframe(
+                cmg_tiempo_real_descarga,
+                SELECCIONAR,
+                unix_timestamp,
+            )
 
             # Preview data
-            if not cmg_ponderado_descarga.empty:
-                filtered_data = cmg_ponderado_descarga[cmg_ponderado_descarga['barra_transmision'] == SELECCIONAR]
-                st.markdown(f"<p>Vista previa ({len(filtered_data)} registros):</p>", unsafe_allow_html=True)
+            if not ponderado_selected.empty:
+                st.markdown(f"<p>Vista previa ({len(ponderado_selected)} registros):</p>", unsafe_allow_html=True)
                 st.dataframe(
-                    filtered_data.head(5),
+                    ponderado_selected.head(5),
                     width="stretch",
                     height=150
                 )
@@ -1501,54 +1554,38 @@ with tab3:
             
             @st.cache_data
             def convert_df(df):
-                'seleccionar central a descargar y convertir a csv'
-                # IMPORTANT: Cache the conversion to prevent computation on every rerun
                 if df.empty:
-                    st.warning(f"No hay datos disponibles para {central_seleccion} en la fecha seleccionada.")
                     return "".encode('utf-8')
-                
-                # Check if barra_transmision column exists
-                if 'barra_transmision' not in df.columns:
-                    st.warning("Los datos no contienen la columna 'barra_transmision'.")
-                    return df.to_csv().encode('utf-8')
-                
-                # Filter by the selected barra
-                filtered_df = df[df['barra_transmision'] == SELECCIONAR]
-                
-                # Check if any rows match the filter
-                if filtered_df.empty:
-                    st.warning(f"No hay datos para {SELECCIONAR} en la fecha seleccionada.")
-                    # Return all data instead of empty
-                    return df.to_csv().encode('utf-8')
-                
-                return filtered_df.to_csv().encode('utf-8')
+                return df.to_csv(index=False).encode('utf-8')
             
             # Add debug information
-            if cmg_ponderado_descarga.empty:
+            if ponderado_selected.empty:
                 st.error("No se encontraron datos de costos marginales ponderados para la fecha seleccionada.")
             
-            csv = convert_df(cmg_ponderado_descarga)
+            csv = convert_df(ponderado_selected)
             
             st.download_button(
                 label="📈 Descargar Costos Marginales Ponderados",
                 data=csv,
                 file_name=f'cmg_ponderados_{central_seleccion}_{date_calculate.strftime("%Y%m%d")}.csv',
                 mime='text/csv',
-                on_click=lambda: add_notification(f"Archivo de costos marginales ponderados para {central_seleccion} descargado", type="success")
+                disabled=ponderado_selected.empty,
+                on_click=(lambda: add_notification(f"Archivo de costos marginales ponderados para {central_seleccion} descargado", type="success")) if not ponderado_selected.empty else None,
             )
             
             # Add debug information
-            if cmg_tiempo_real_descarga.empty:
+            if tiempo_real_selected.empty:
                 st.error("No se encontraron datos de costos marginales en tiempo real para la fecha seleccionada.")
             
-            csv_2 = convert_df(cmg_tiempo_real_descarga)
+            csv_2 = convert_df(tiempo_real_selected)
             
             st.download_button(
                 label="⚡ Descargar Costos Marginales en Tiempo Real",
                 data=csv_2,
                 file_name=f'cmg_tiempo_real_{central_seleccion}_{date_calculate.strftime("%Y%m%d")}.csv',
                 mime='text/csv',
-                on_click=lambda: add_notification(f"Archivo de costos marginales en tiempo real para {central_seleccion} descargado", type="success")
+                disabled=tiempo_real_selected.empty,
+                on_click=(lambda: add_notification(f"Archivo de costos marginales en tiempo real para {central_seleccion} descargado", type="success")) if not tiempo_real_selected.empty else None,
             )
             
             st.markdown('</div>', unsafe_allow_html=True)
@@ -1560,7 +1597,7 @@ with tab3:
 with st.container():
     st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
     
-    st.markdown("""
+    st.markdown(f"""
     <div style="display: flex; justify-content: space-between; align-items: center; padding: 1rem 0;">
         <div>
             <p style="font-weight: 600; margin-bottom: 0.5rem;">Costos Eléctricos Chile</p>
@@ -1608,25 +1645,9 @@ with tab1:
             Mediante la fórmula: ((Porcentaje Brent × Precio Brent) + Tasa Proveedor) × Factor Motor + Tasa Central + Margen de Garantía
             """)
 
-# Add dark mode toggle in a sidebar
 with st.sidebar:
-    st.title("Configuración")
-    
-    # Dark mode toggle
-    dark_mode = st.toggle("Modo oscuro", value=st.session_state['dark_mode'])
-    if dark_mode != st.session_state['dark_mode']:
-        st.session_state['dark_mode'] = dark_mode
-        add_notification("Modo de visualización cambiado", type="info")
-        st.experimental_rerun()
-    
-    # Language selection for future multi-language support
-    st.selectbox("Idioma", ["Español", "English"], index=0, disabled=True)
-    
-    # Add status information box
     st.markdown("---")
     st.markdown("### Monitoreo")
-    
-    # Status message that shows what data is being displayed
     st.markdown(f"""
     <p style='font-size: 0.9rem;'>
         Mostrando datos de las últimas {st.session_state['time_range']} horas 
@@ -1639,98 +1660,13 @@ with st.sidebar:
     </p>
     """, unsafe_allow_html=True)
     
-    # Status information about database connection and update times
     st.markdown(f"**Última Actualización:** {ultimo_tracking}")
-    
     if CONN_STATUS:
         connection_status = '<span style="color:#00b300; font-weight:bold;">Conectado</span>'
     else:
         connection_status = '<span style="color:#cc0000; font-weight:bold;">Desconectado</span>'
-    
     st.markdown(f"**Estado DB:** {connection_status}", unsafe_allow_html=True)
     st.markdown(f"**Modificación CEN:** {ultimo_mod_rio}")
-    
-    # Add divider
-    st.markdown("---")
-    
-    # Move visualization settings from tab1 to sidebar
-    st.markdown("### Visualización")
-    
-    # Auto-refresh toggle moved from tab1
-    auto_refresh_enabled = st.toggle("Actualización automática", value=st.session_state['auto_refresh'])
-    if auto_refresh_enabled != st.session_state['auto_refresh']:
-        st.session_state['auto_refresh'] = auto_refresh_enabled
-        st.session_state['last_refresh_time'] = time.time()
-    
-    if auto_refresh_enabled:
-        refresh_interval = st.select_slider(
-            "Intervalo (minutos)", 
-            options=[1, 2, 5, 10, 15, 30, 60],
-            value=st.session_state['refresh_interval']
-        )
-        if refresh_interval != st.session_state['refresh_interval']:
-            st.session_state['refresh_interval'] = refresh_interval
-            st.session_state['last_refresh_time'] = time.time()
-        
-        # Display countdown
-        remaining = auto_refresh()
-        if remaining is not None:
-            st.markdown(f"<p style='font-size: 0.8rem; color: #666;'>Próxima actualización en: {remaining//60}m {remaining%60}s</p>", unsafe_allow_html=True)
-    
-    # Time range selector moved from tab1
-    st.markdown("### Rango de tiempo")
-    time_range_options = {
-        "12h": 12,
-        "24h": 24,
-        "48h": 48, 
-        "72h": 72,
-        "7d": 168
-    }
-    
-    time_range = st.radio(
-        "Seleccione rango:",
-        options=list(time_range_options.keys()),
-        horizontal=True,
-        index=list(time_range_options.values()).index(st.session_state['time_range']) if st.session_state['time_range'] in time_range_options.values() else 2
-    )
-    
-    # Update time range based on selection
-    if time_range in time_range_options:
-        selected_hours = time_range_options[time_range]
-        if selected_hours != st.session_state['time_range']:
-            st.session_state['time_range'] = selected_hours
-    
-    # Chart type selection moved from tab1
-    st.markdown("### Tipo de gráfico")
-    chart_type = st.radio(
-        "Seleccione tipo:",
-        options=["Línea", "Área", "Barra"],
-        horizontal=True,
-        index=0 if st.session_state['chart_type'] == 'line' else 1 if st.session_state['chart_type'] == 'area' else 2
-    )
-    
-    if chart_type == "Línea" and st.session_state['chart_type'] != 'line':
-        st.session_state['chart_type'] = 'line'
-    elif chart_type == "Área" and st.session_state['chart_type'] != 'area':
-        st.session_state['chart_type'] = 'area'
-    elif chart_type == "Barra" and st.session_state['chart_type'] != 'bar':
-        st.session_state['chart_type'] = 'bar'
-    
-    # Data display toggles moved from tab1
-    st.markdown("### Datos a mostrar")
-    show_charrua = st.checkbox("Charrúa (Los Angeles)", value=st.session_state['show_charrua'])
-    if show_charrua != st.session_state['show_charrua']:
-        st.session_state['show_charrua'] = show_charrua
-        
-    show_quillota = st.checkbox("Quillota", value=st.session_state['show_quillota'])
-    if show_quillota != st.session_state['show_quillota']:
-        st.session_state['show_quillota'] = show_quillota
-        
-    show_costs = st.checkbox("Costos Operacionales", value=st.session_state['show_operational_costs'])
-    if show_costs != st.session_state['show_operational_costs']:
-        st.session_state['show_operational_costs'] = show_costs
-    
-    # About section
     st.markdown("---")
     st.markdown("### Acerca de")
     st.markdown("""
