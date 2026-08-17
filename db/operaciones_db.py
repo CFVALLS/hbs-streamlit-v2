@@ -4,24 +4,18 @@ Módulo para operaciones de base de datos incluyendo inserciones y consultas a l
 # general modules
 import logging
 from datetime import datetime
-import random
 
 import pandas as pd
 
 # mysql
-from sqlalchemy import create_engine, desc, func, inspect
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy import create_engine, desc, func, inspect, or_
+from sqlalchemy.orm import joinedload, sessionmaker, Session
 from sqlalchemy.orm import declarative_base
 from sqlalchemy.orm.exc import NoResultFound
 
 # import models
 from .models_orm import *
-from .db_utils import (
-    generate_fallback_cmg_ponderado,
-    generate_fallback_cmg_tiempo_real,
-    safe_bool_convert,
-    safe_float_convert,
-)
+from .db_utils import safe_bool_convert, safe_float_convert
 from scripts.utils.utils import setup_logging, get_timestamp_from_unix_time, get_date, get_logger
 
 #########################################################################
@@ -89,12 +83,10 @@ def retrieve_tracking_coordinador(session, id=None, limit=None):
                 result.rio_mod,
             ]
 
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        return [1, now_str, now_str, True]
+        return [None, None, None, None]
     except Exception as e:
         logger.error(f"Error retrieving tracking coordinador: {e}")
-        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        return [1, now_str, now_str, True]
+        raise
 
 def retrieve_ultima_modificacion_rio_file(session, fecha=None, hora=None):
     """
@@ -262,7 +254,9 @@ def retrieve_latest_desacople_event(session, barra_transmision=None, timestamp=N
     try:
         inspector = inspect(session.bind)
         if DesacopleHistory.__tablename__ not in inspector.get_table_names():
-            return None
+            raise RuntimeError(
+                f"La tabla requerida {DesacopleHistory.__tablename__} no existe"
+            )
 
         query = session.query(DesacopleHistory)
         if barra_transmision is not None:
@@ -280,7 +274,7 @@ def retrieve_latest_desacople_event(session, barra_transmision=None, timestamp=N
         return query.order_by(DesacopleHistory.detected_at.desc(), DesacopleHistory.id.desc()).first()
     except Exception as e:
         logger.error(f"Error en retrieve_latest_desacople_event: {e}")
-        return None
+        raise
 
 
 def was_notification_sent(session, canal, destino, plantilla, timestamp_envio, contenido=None):
@@ -937,11 +931,11 @@ def retrieve_status_desacople(session, barra_transmision_in=None, timestamp=None
             f"Sin evento histórico en {DesacopleHistory.__tablename__} para barra {barra_transmision_in}"
             + (f" al timestamp {timestamp}" if timestamp is not None else "")
         )
-        return False, None
+        return None, None
 
     except Exception as e:
         logger.error(f"Error en retrieve_status_desacople: {e}")
-        return False, None
+        raise
     
 ########### Funciones Factor Penalizacion y TCO ###################
 
@@ -1298,6 +1292,89 @@ def retrieve_valor_factor_penalizacion(session_in, barra_in, request_timestamp=N
         return 1.0  # Default to 1.0 on error
     
 ########################################  CENTRAL ########################################
+
+
+def _record_unix_time(record, timestamp_attribute):
+    unix_time = getattr(record, 'unix_time', None)
+    if unix_time is not None:
+        try:
+            return int(unix_time)
+        except (TypeError, ValueError):
+            return None
+
+    timestamp = _normalize_desacople_timestamp(
+        getattr(record, timestamp_attribute, None)
+    )
+    return int(timestamp.timestamp()) if timestamp is not None else None
+
+
+def _match_costs_to_central_revisions(session_in, central_rows):
+    """Match legacy costs to the revision interval in which they were recorded."""
+    if not central_rows:
+        return {}
+
+    central_names = {row.nombre for row in central_rows if row.nombre}
+    revisions = session_in.query(CentralTable).filter(
+        CentralTable.nombre.in_(central_names)
+    ).order_by(CentralTable.nombre, CentralTable.id).all()
+    revision_ids = [row.id for row in revisions]
+    costs = session_in.query(CentralCostoOperacional).filter(
+        or_(
+            CentralCostoOperacional.central_nombre.in_(central_names),
+            CentralCostoOperacional.central_id.in_(revision_ids),
+        )
+    ).order_by(
+        CentralCostoOperacional.unix_time,
+        CentralCostoOperacional.id,
+    ).all()
+
+    revision_name_by_id = {revision.id: revision.nombre for revision in revisions}
+    costs_by_name = {name: [] for name in central_names}
+    for cost in costs:
+        name = cost.central_nombre or revision_name_by_id.get(cost.central_id)
+        if name in costs_by_name:
+            costs_by_name[name].append(cost)
+
+    matches = {}
+    for name in central_names:
+        named_revisions = [revision for revision in revisions if revision.nombre == name]
+        revision_times = [
+            _record_unix_time(revision, 'fecha_registro')
+            for revision in named_revisions
+        ]
+        named_costs = costs_by_name[name]
+
+        for index, revision in enumerate(named_revisions):
+            start_time = revision_times[index]
+            next_times = [
+                value for value in revision_times[index + 1:]
+                if value is not None
+            ]
+            end_time = next_times[0] if next_times else None
+            if start_time is None or (end_time is not None and end_time <= start_time):
+                continue
+
+            candidates = []
+            for cost in named_costs:
+                cost_time = _record_unix_time(cost, 'timestamp')
+                if cost_time is None or cost_time < start_time:
+                    continue
+                if end_time is not None and cost_time >= end_time:
+                    continue
+                candidates.append(cost)
+
+            if candidates:
+                matches[revision.id] = max(
+                    candidates,
+                    key=lambda cost: (
+                        _record_unix_time(cost, 'timestamp'),
+                        cost.id,
+                    ),
+                )
+
+    return matches
+
+
 def query_last_row_central(session_in, name_central):
     """
     Retrieves the last entry from the 'central' table based on the provided name.
@@ -1342,7 +1419,7 @@ def query_last_row_central(session_in, name_central):
         return None
     except Exception as e:
         logger.error(f"Error while getting last entry by name: {e}")
-        return None
+        raise
 
        
 def retrieve_all_centrales(session, centrales = ["Los Angeles", "Quillota"]):
@@ -1429,7 +1506,9 @@ def inject_costo_operacional(session, central_nombre, costo_operacional, timesta
             
         # Get central_id if not provided
         if central_id is None and central_nombre is not None:
-            central = session.query(CentralTable).filter_by(nombre=central_nombre).first()
+            central = session.query(CentralTable).filter_by(
+                nombre=central_nombre
+            ).order_by(desc(CentralTable.id)).first()
             if central:
                 central_id = central.id
                 logger.info(f"Obtenido central_id: {central_id}")
@@ -1559,8 +1638,10 @@ def query_central_table(session_in, num_entries=6):
         ).limit(num_entries).all()
 
         if centrals:
+            costs_by_revision = _match_costs_to_central_revisions(session_in, centrals)
             data = []
             for central in centrals:
+                latest_cost = costs_by_revision.get(central.id)
                 entry = {
                     'id': central.id,
                     'nombre': central.nombre,
@@ -1575,7 +1656,7 @@ def query_central_table(session_in, num_entries=6):
                     'external_update': getattr(central, 'external_update', False),
                     'editor': getattr(central, 'editor', ''),
                     'generando': getattr(central, 'generando', False),
-                    'costo_operacional': getattr(central, 'costo_operacional', 0.0),
+                    'costo_operacional': latest_cost.costo_operacional if latest_cost else None,
                     'fecha_referencia_brent': getattr(central, 'fecha_referencia_brent', None),
                 }
                 data.append(entry)
@@ -1590,12 +1671,7 @@ def query_central_table(session_in, num_entries=6):
         ])
     except Exception as e:
         logger.error(f"Error in query_central_table: {e}")
-        return pd.DataFrame(columns=[
-            'id', 'nombre', 'generando', 'barra_transmision', 'tasa_proveedor',
-            'porcentaje_brent', 'tasa_central', 'precio_brent', 'margen_garantia',
-            'costo_operacional', 'factor_motor', 'fecha_referencia_brent',
-            'fecha_registro', 'external_update', 'editor',
-        ])
+        raise
 
 
 def query_central_table_modifications(session_in, num_entries=10):
@@ -1610,8 +1686,10 @@ def query_central_table_modifications(session_in, num_entries=10):
         ).limit(num_entries).all()
 
         if centrals:
+            costs_by_revision = _match_costs_to_central_revisions(session_in, centrals)
             data = []
             for central in centrals:
+                latest_cost = costs_by_revision.get(central.id)
                 entry = {
                     'id': central.id,
                     'nombre': central.nombre,
@@ -1626,7 +1704,7 @@ def query_central_table_modifications(session_in, num_entries=10):
                     'external_update': True,
                     'editor': getattr(central, 'editor', ''),
                     'generando': getattr(central, 'generando', False),
-                    'costo_operacional': getattr(central, 'costo_operacional', 0.0),
+                    'costo_operacional': latest_cost.costo_operacional if latest_cost else None,
                     'fecha_referencia_brent': getattr(central, 'fecha_referencia_brent', None),
                 }
                 data.append(entry)
@@ -1643,14 +1721,7 @@ def query_central_table_modifications(session_in, num_entries=10):
         return df
     except Exception as e:
         logger.error(f"Error in query_central_table_modifications: {e}")
-        df = pd.DataFrame(columns=[
-            'id', 'nombre', 'generando', 'barra_transmision', 'tasa_proveedor',
-            'porcentaje_brent', 'tasa_central', 'precio_brent', 'margen_garantia',
-            'costo_operacional', 'factor_motor', 'fecha_referencia_brent',
-            'fecha_registro', 'external_update', 'editor',
-        ])
-        df['external_update'] = True
-        return df
+        raise
 
 
 def query_cmg_ponderado_by_time(session_in, unixtime, delta_hours=48):
@@ -1672,10 +1743,10 @@ def query_cmg_ponderado_by_time(session_in, unixtime, delta_hours=48):
                 'cmg_ponderado': record.cmg_ponderado,
             } for record in results]
 
-        return generate_fallback_cmg_ponderado(unixtime, delta_hours)
+        return []
     except Exception as e:
         logger.error(f"Error in query_cmg_ponderado_by_time: {e}")
-        return generate_fallback_cmg_ponderado(unixtime, delta_hours)
+        raise
 
 
 def get_cmg_tiempo_real(session_in, unix_time_in):
@@ -1709,29 +1780,10 @@ def get_cmg_tiempo_real(session_in, unix_time_in):
             if data:
                 return data
 
-        return generate_fallback_cmg_tiempo_real(unix_time_in)
+        return []
     except Exception as e:
         logger.error(f"Error in get_cmg_tiempo_real: {e}")
-        return generate_fallback_cmg_tiempo_real(unix_time_in)
-
-
-def generate_fallback_cmg_programados(name_central):
-    """
-    Generates fallback data for CMG programados when database query fails.
-    """
-    if name_central.lower() == 'quillota':
-        base_value = 48.0
-    elif name_central.lower() == 'los angeles':
-        base_value = 45.0
-    else:
-        base_value = 50.0
-
-    result = {}
-    for hour in range(24):
-        variation = (random.random() - 0.5) * 5
-        hour_key = f"{hour:02d}:00"
-        result[hour_key] = round(base_value + hour * 0.5 + variation, 2)
-    return result
+        raise
 
 
 def get_cmg_programados(session_in, name_central, date_in):
@@ -1751,13 +1803,14 @@ def get_cmg_programados(session_in, name_central, date_in):
             for hour in range(24):
                 hour_key = f"{hour:02d}:00"
                 value = getattr(result, f"_{hour:02d}_00", None)
-                data[hour_key] = float(value) if value is not None else 50.0 + hour
+                if value is not None:
+                    data[hour_key] = float(value)
             return data
 
-        return generate_fallback_cmg_programados(name_central)
+        return {}
     except Exception as e:
         logger.error(f"Error retrieving CMG programados for {name_central} on {date_in}: {e}")
-        return generate_fallback_cmg_programados(name_central)
+        raise
 
 
 def get_latest_status_central(session_in, central_name):
@@ -1776,10 +1829,10 @@ def get_latest_status_central(session_in, central_name):
         return None
     except Exception as e:
         logger.error(f"Error fetching latest status for {central_name}: {e}")
-        return None
+        raise
 
 
-def get_status_central_history(session_in, limit=50, centrals=None):
+def get_status_central_history(session_in, limit=50, centrals=None, since_unix=None):
     """
     Retrieves the status history for centrals from the status_central table.
     """
@@ -1788,24 +1841,44 @@ def get_status_central_history(session_in, limit=50, centrals=None):
             logger.error("Cannot query status_central: session is None")
             return pd.DataFrame()
 
-        query = session_in.query(StatusCentral)
+        base_query = session_in.query(StatusCentral).options(
+            joinedload(StatusCentral.costo_operacional_rel)
+        )
         if centrals and isinstance(centrals, list):
-            query = query.filter(StatusCentral.central.in_(centrals))
-
-        query = query.order_by(desc(StatusCentral.unix_time))
-        if limit:
-            query = query.limit(limit)
-
-        results = query.all()
+            results = []
+            for central_name in centrals:
+                central_query = base_query.filter(StatusCentral.central == central_name)
+                if since_unix is not None:
+                    recent = central_query.filter(
+                        StatusCentral.unix_time >= since_unix
+                    ).order_by(desc(StatusCentral.unix_time)).all()
+                    predecessor = central_query.filter(
+                        StatusCentral.unix_time < since_unix
+                    ).order_by(desc(StatusCentral.unix_time)).first()
+                    results.extend(recent)
+                    if predecessor is not None:
+                        results.append(predecessor)
+                else:
+                    central_query = central_query.order_by(desc(StatusCentral.unix_time))
+                    if limit:
+                        central_query = central_query.limit(limit)
+                    results.extend(central_query.all())
+            results.sort(key=lambda row: row.unix_time, reverse=True)
+        else:
+            query = base_query
+            if since_unix is not None:
+                query = query.filter(StatusCentral.unix_time >= since_unix)
+            query = query.order_by(desc(StatusCentral.unix_time))
+            if limit and since_unix is None:
+                query = query.limit(limit)
+            results = query.all()
         if not results:
             logger.warning("No status history found")
             return pd.DataFrame()
 
         data = []
         for status in results:
-            costo_op = session_in.query(CentralCostoOperacional).filter_by(
-                id=status.costo_operacional_id
-            ).first()
+            costo_op = status.costo_operacional_rel
 
             try:
                 fecha = pd.to_datetime(status.timestamp).strftime('%Y-%m-%d')
@@ -1832,7 +1905,7 @@ def get_status_central_history(session_in, limit=50, centrals=None):
         return pd.DataFrame(data)
     except Exception as e:
         logger.error(f"Error fetching status history: {e}")
-        return pd.DataFrame()
+        raise
 
 
 def get_latest_desacople_event(session, barra_transmision: str):
@@ -1856,7 +1929,7 @@ def get_latest_desacople_event(session, barra_transmision: str):
         }
     except Exception as e:
         logger.error(f"Error al obtener último evento de desacople para {barra_transmision}: {e}")
-        return None
+        raise
 
 
 def query_values_last_desacople_bool(session_in, barra_transmision):
@@ -1884,5 +1957,5 @@ def query_values_last_desacople_bool(session_in, barra_transmision):
         return result.central_referencia, desacople_bool, result.cmg
     except Exception as e:
         logger.error(f"Error in query_values_last_desacople_bool: {e}")
-        return None, None, None
+        raise
     
